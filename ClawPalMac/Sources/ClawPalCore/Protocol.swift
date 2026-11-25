@@ -259,6 +259,7 @@ public enum ClawPalHTTP {
     private static let session: URLSession = {
         let cfg = URLSessionConfiguration.ephemeral
         cfg.connectionProxyDictionary = [:]
+        cfg.httpMaximumConnectionsPerHost = 1
         cfg.timeoutIntervalForRequest = 10
         cfg.timeoutIntervalForResource = 12
         return URLSession(configuration: cfg)
@@ -271,6 +272,7 @@ public enum ClawPalHTTP {
         var req = URLRequest(url: url)
         req.httpMethod = "GET"
         req.setValue(endpoint.sign(method: "GET", path: path, token: token), forHTTPHeaderField: "Authorization")
+        req.setValue("close", forHTTPHeaderField: "Connection")
         let (data, response) = try await session.data(for: req)
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
         return (status, data)
@@ -294,6 +296,7 @@ public enum ClawPalHTTP {
         req.setValue(endpoint.sign(method: "POST", path: path, token: token, bodyHash: bodyHash), forHTTPHeaderField: "Authorization")
         req.setValue(bodyHash, forHTTPHeaderField: "X-ClawPal-Body-SHA256")
         req.setValue(contentType, forHTTPHeaderField: "Content-Type")
+        req.setValue("close", forHTTPHeaderField: "Connection")
         for (k, v) in extraHeaders { req.setValue(v, forHTTPHeaderField: k) }
         let (data, response) = try await session.data(for: req)
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0

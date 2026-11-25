@@ -579,7 +579,7 @@ public final class CompanionEngine: ObservableObject {
             }
 
             healthTick += 1
-            if healthTick % 10 == 0 {
+            if healthTick % 60 == 0 {
                 refreshHealth()
             }
 

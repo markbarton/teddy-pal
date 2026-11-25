@@ -16,16 +16,13 @@
 | :---: | :---: |
 | ![PC Monitor screen](docs/screenshots/monitor.png) | ![Media Now Playing screen](docs/screenshots/media.png) |
 
-| Claude Code Usage & Tasks | Amp Usage & Need-You Alerts |
+| Claude Code Usage & Tasks | Amp Usage Gauges |
 | :---: | :---: |
-| ![Claude Code screen](docs/screenshots/claude.png) | ![Amp screen](docs/screenshots/amp.png) |
+| ![Claude Code screen](docs/screenshots/claude.png) | ![Amp usage screen](docs/screenshots/amp.png) |
 
-<details>
-<summary>More screenshots (Weather Detail)</summary>
-
-![Weather Detail screen](docs/screenshots/weather.png)
-
-</details>
+| Amp "Need You" Shortcuts (Tap to Open) | Weather Detail |
+| :---: | :---: |
+| ![Amp Need-You cards](docs/screenshots/amp-need-you.png) | ![Weather Detail screen](docs/screenshots/weather.png) |
 
 ---
 
