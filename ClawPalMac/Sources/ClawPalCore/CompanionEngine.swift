@@ -444,17 +444,22 @@ public final class CompanionEngine: ObservableObject {
         var retrySeconds: UInt64 = 1
         while !Task.isCancelled {
             status = .searching
+            let startedAt = Date()
             do {
                 try await runSingleSession()
                 retrySeconds = 1
             } catch is CancellationError {
                 break
             } catch {
-                appendLog("Connection: \(error.localizedDescription)")
+                // If we stayed connected for at least 15s before dropping, reconnect immediately (1s).
+                if Date().timeIntervalSince(startedAt) >= 15 {
+                    retrySeconds = 1
+                }
+                appendLog("Connection: \(error.localizedDescription) (retry in \(retrySeconds)s)")
                 status = .searching
             }
             try? await Task.sleep(for: .seconds(retrySeconds))
-            retrySeconds = min(retrySeconds * 2, 10)
+            retrySeconds = min(retrySeconds + 1, 3)
         }
     }
 
@@ -601,8 +606,8 @@ public final class CompanionEngine: ObservableObject {
 
             try await Task.sleep(for: .seconds(1))
 
-            if Date().timeIntervalSince(state.lastAck) > 10 {
-                throw ClawPalError.invalidResponse("Display stopped acknowledging")
+            if Date().timeIntervalSince(state.lastAck) > 15 {
+                throw ClawPalError.invalidResponse("Display stopped acknowledging (last ack \(Int(Date().timeIntervalSince(state.lastAck)))s ago, frame \(payloadData.count)B)")
             }
         }
     }
@@ -730,10 +735,29 @@ public final class CompanionEngine: ObservableObject {
         return f
     }()
 
+    private static let appLogURL: URL = ClawPalPaths.home.appendingPathComponent("app.log")
+
     public func appendLog(_ message: String) {
-        let line = LogLine(time: Self.timeFmt.string(from: Date()), message: message)
+        let stamp = Self.timeFmt.string(from: Date())
+        let line = LogLine(time: stamp, message: message)
         logs.append(line)
         if logs.count > 200 { logs.removeFirst(logs.count - 200) }
+
+        let text = "[\(stamp)] \(message)\n"
+        if let data = text.data(using: .utf8) {
+            let url = Self.appLogURL
+            try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            if let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+               let size = attrs[.size] as? Int, size > 100_000 {
+                try? data.write(to: url, options: .atomic)
+            } else if let fh = try? FileHandle(forWritingTo: url) {
+                defer { try? fh.close() }
+                _ = try? fh.seekToEnd()
+                try? fh.write(contentsOf: data)
+            } else {
+                try? data.write(to: url, options: .atomic)
+            }
+        }
     }
 }
 

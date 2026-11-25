@@ -193,11 +193,12 @@ public enum ClawPalDiscovery {
 
         var broadcast: Int32 = 1
         setsockopt(fd, SOL_SOCKET, SO_BROADCAST, &broadcast, socklen_t(MemoryLayout<Int32>.size))
-        var tv = timeval(tv_sec: 1, tv_usec: 0)
+        var tv = timeval(tv_sec: 2, tv_usec: 500_000)
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
 
-        var targets = ["255.255.255.255"]
+        var targets: [String] = []
         if let lastHost, !lastHost.isEmpty { targets.append(lastHost) }
+        targets.append("255.255.255.255")
         let probe = Array("BUDDYOS_DISCOVER_V1 \(nonce)".utf8)
 
         for _ in 0..<tries {
@@ -214,7 +215,7 @@ public enum ClawPalDiscovery {
                 }
             }
 
-            let deadline = Date().addingTimeInterval(1.0)
+            let deadline = Date().addingTimeInterval(2.5)
             while Date() < deadline {
                 var buf = [UInt8](repeating: 0, count: 1024)
                 var senderAddr = sockaddr_in()
