@@ -1,0 +1,1322 @@
+diff --git a/firmware/main/CMakeLists.txt b/firmware/main/CMakeLists.txt
+index a841710..88c251a 100644
+--- a/firmware/main/CMakeLists.txt
++++ b/firmware/main/CMakeLists.txt
+@@ -2,10 +2,10 @@ idf_component_register(
+     SRCS "language/buddy_language_font_14.c" "language/buddy_language_font_16.c" "language/buddy_language_font_20.c" "language/buddy_language_font_24.c" "language/buddy_language_font_32.c" "language/buddy_language_font_48.c" "main.c" "language/buddy_language.c" "language/buddy_language_data.c" "update/buddy_update.c" "settings/buddy_settings.c" "ui/buddy_ui.c" "ui/buddy_ui_motion.c" "network/buddy_network.c" "network/buddy_telemetry_parse.c" "network/buddy_auth.c" "network/buddy_shortcuts_parse.c" "assets/buddy_mascot.c" "assets/buddy_clock_font.c"
+          "assets/buddy_music_font_20.c" "assets/buddy_music_font_32.c"
+          "assets/buddy_numeral_font_96.c" "assets/buddy_numeral_font_48.c" "assets/buddy_numeral_font_32.c" "assets/buddy_numeral_font_24.c" "assets/buddy_numeral_font_128.c"
+-         "weather/buddy_weather.c" "weather/buddy_weather_parse.c"
++         "weather/buddy_weather.c" "weather/buddy_weather_parse.c" "nfc/buddy_nfc.c"
+          "ui/buddy_home.c" "ui/buddy_theme.c" "ui/buddy_theme_data.c" "ui/buddy_weather_page.c" "ui/buddy_weather_icon.c" "ui/buddy_app_icons.c" "ui/buddy_shortcut_data.c" "ui/buddy_shortcuts_page.c" "assets/buddy_home_logos.c"
+          "../tests/display_power_policy.c" "../tests/weather_animation_policy.c" "../tests/weather_units.cpp"
+-    INCLUDE_DIRS "language" "include" "ui" "network" "assets" "weather" "settings" "update"
+-    REQUIRES board esp_wifi esp_netif esp_event esp_http_server esp_http_client nvs_flash json mbedtls lwip esp_timer esp_hw_support
++    INCLUDE_DIRS "language" "include" "ui" "network" "assets" "weather" "settings" "update" "nfc"
++    REQUIRES board driver esp_wifi esp_netif esp_event esp_http_server esp_http_client nvs_flash json mbedtls lwip esp_timer esp_hw_support
+     PRIV_REQUIRES esp_app_format app_update bootloader_support espcoredump esp_partition
+ )
+diff --git a/firmware/main/include/buddy_model.h b/firmware/main/include/buddy_model.h
+index aff1567..2fbbf35 100644
+--- a/firmware/main/include/buddy_model.h
++++ b/firmware/main/include/buddy_model.h
+@@ -69,9 +69,12 @@ typedef struct {
+     uint32_t resets_at;
+ } buddy_codex_window_t;
+ 
++#define BUDDY_CODEX_MAX_TASKS 8
++
+ typedef struct {
+     char title[64];
+     char project[32];
++    char detail[80];
+     char state[16];
+     uint32_t age_s;
+ } buddy_codex_task_t;
+@@ -84,7 +87,7 @@ typedef struct {
+     uint32_t working_count;
+     uint32_t total_count;
+     uint32_t item_count;
+-    buddy_codex_task_t items[3];
++    buddy_codex_task_t items[BUDDY_CODEX_MAX_TASKS];
+ } buddy_codex_activity_t;
+ 
+ typedef struct {
+diff --git a/firmware/main/main.c b/firmware/main/main.c
+index 2dc2d0b..6787e4f 100644
+--- a/firmware/main/main.c
++++ b/firmware/main/main.c
+@@ -8,6 +8,7 @@
+ #include "board.h"
+ #include "buddy_model.h"
+ #include "buddy_network.h"
++#include "buddy_nfc.h"
+ #include "buddy_ui.h"
+ #include "buddy_display_power.h"
+ #include "buddy_weather.h"
+@@ -30,7 +31,7 @@ typedef enum { EVENT_STATE, EVENT_STATS, EVENT_CONFIRM } event_kind_t;
+ typedef struct {
+     event_kind_t kind;
+     union {
+-        buddy_stats_t stats;
++        buddy_stats_t *stats;
+         struct {
+             buddy_confirm_action_t action;
+             char detail[BUDDY_CONFIRM_DETAIL_SIZE];
+@@ -61,9 +62,19 @@ static void on_state(buddy_connection_state_t state, const char *ssid,
+ 
+ static void on_stats(const buddy_stats_t *stats)
+ {
++    buddy_stats_t *copy = malloc(sizeof(*copy));
++    if (!copy) return;
++    *copy = *stats;
+     ui_event_t event = {.kind = EVENT_STATS};
+-    event.data.stats = *stats;
+-    xQueueSend(ui_events, &event, 0);
++    event.data.stats = copy;
++    if (xQueueSend(ui_events, &event, 0) != pdTRUE) {
++        free(copy);
++    }
++}
++
++static void on_nfc_tap(const char *uid_hex)
++{
++    buddy_network_send_nfc(uid_hex);
+ }
+ 
+ static void on_confirm(buddy_confirm_action_t action, const char *detail)
+@@ -152,6 +163,9 @@ void app_main(void)
+         ESP_LOGE(TAG, "Network startup failed: %s", esp_err_to_name(err));
+         on_state(BUDDY_PC_OFFLINE, "", "", BT(BT_NETWORK_STARTUP_FAILED_RESTART_BUDDY));
+     }
++    if (buddy_nfc_start(on_nfc_tap) != ESP_OK) {
++        ESP_LOGW(TAG, "NFC reader task startup failed");
++    }
+     esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+     esp_sntp_setservername(0, "pool.ntp.org");
+     esp_sntp_setservername(1, "time.cloudflare.com");
+@@ -173,9 +187,9 @@ void app_main(void)
+             /* A paired PC supplies time even when internet time is unavailable. */
+             time_t current;
+             time(&current);
+-            if (current < 1700000000 && event.data.stats.timestamp_ms > 1700000000000LL) {
+-                struct timeval tv = {.tv_sec = event.data.stats.timestamp_ms / 1000,
+-                                     .tv_usec = (event.data.stats.timestamp_ms % 1000) * 1000};
++            if (current < 1700000000 && event.data.stats->timestamp_ms > 1700000000000LL) {
++                struct timeval tv = {.tv_sec = event.data.stats->timestamp_ms / 1000,
++                                     .tv_usec = (event.data.stats->timestamp_ms % 1000) * 1000};
+                 settimeofday(&tv, NULL);
+             }
+         }
+@@ -187,13 +201,15 @@ void app_main(void)
+             } else if (received && event.kind == EVENT_CONFIRM) {
+                 buddy_ui_request_confirmation(event.data.confirm.action, event.data.confirm.detail);
+             } else if (received) {
+-                buddy_ui_update_stats(&event.data.stats);
++                buddy_ui_update_stats(event.data.stats);
+                 if (last_log_us == 0 || now_us - last_log_us >= 60000000) {
+                     ESP_LOGI(TAG, "Live PC stats received, sequence=%llu, CPU=%.1f%%, GPU=%.1f%%",
+-                             (unsigned long long)event.data.stats.sequence,
+-                             event.data.stats.cpu_usage, event.data.stats.gpu_usage);
++                             (unsigned long long)event.data.stats->sequence,
++                             event.data.stats->cpu_usage, event.data.stats->gpu_usage);
+                     last_log_us = now_us;
+                 }
++                free(event.data.stats);
++                event.data.stats = NULL;
+             }
+             if (now_us - last_clock_us >= 1000000) {
+                 update_clock();
+diff --git a/firmware/main/network/buddy_network.c b/firmware/main/network/buddy_network.c
+index b9c0315..3e4c44d 100644
+--- a/firmware/main/network/buddy_network.c
++++ b/firmware/main/network/buddy_network.c
+@@ -10,6 +10,7 @@
+ #include "buddy_weather.h"
+ #include "buddy_shortcuts.h"
+ #include "buddy_shortcuts_page.h"
++#include "buddy_nfc.h"
+ 
+ #include <ctype.h>
+ #include <errno.h>
+@@ -46,7 +47,7 @@
+ 
+ #define DISCOVERY_PORT 42170
+ #define MONITOR_PORT 42171
+-#define MAX_MESSAGE 6144
++#define MAX_MESSAGE 8192
+ #define CONNECTED_BIT BIT0
+ #define RESTART_BIT BIT1
+ #define PC_TIMEOUT_US (10LL * 1000 * 1000)
+@@ -103,6 +104,10 @@ static QueueHandle_t music_command_queue;
+ static music_command_t pending_music_command;
+ static bool music_command_pending;
+ static uint32_t next_music_control_id;
++static int nfc_pending_fd = -1;
++static uint32_t nfc_pending_generation;
++static uint32_t nfc_pending_seq;
++static char nfc_pending_uid[24];
+ static int64_t last_frame_us;
+ static int64_t disconnected_since_us;
+ static buddy_connection_state_t published_state = (buddy_connection_state_t)-1;
+@@ -298,7 +303,7 @@ static bool music_action_valued(music_action_t action)
+ 
+ static bool activity_waiting(const buddy_codex_activity_t *activity)
+ {
+-    for (uint32_t i = 0; i < activity->item_count && i < 3; ++i)
++    for (uint32_t i = 0; i < activity->item_count && i < BUDDY_CODEX_MAX_TASKS; ++i)
+         if (strcmp(activity->items[i].state, "waiting") == 0) return true;
+     return false;
+ }
+@@ -385,7 +390,8 @@ bool buddy_network_music_control(const char *action, uint32_t value)
+     else if (strcmp(action, "shortcut") == 0) selected = MUSIC_SHORTCUT;
+     else return false;
+     if ((selected == MUSIC_SEEK && value > BUDDY_MUSIC_MAX_SECONDS) || (selected == MUSIC_VOLUME && value > 100) ||
+-        (selected == MUSIC_FOCUS && value != BUDDY_APP_CODEX && value != BUDDY_APP_CLAUDE) ||
++        (selected == MUSIC_FOCUS && value != BUDDY_APP_CODEX && value != BUDDY_APP_CLAUDE &&
++         !(value >= 100U && value < 100U + BUDDY_CODEX_MAX_TASKS)) ||
+         (selected == MUSIC_SHORTCUT && ((value & 31U) >= BUDDY_SHORTCUT_SLOTS || (value >> 5) < 1 || (value >> 5) > BUDDY_SHORTCUT_MAX_REV))) return false;
+     if (!music_action_valued(selected)) value = 0;
+     if (!(xEventGroupGetBits(events) & CONNECTED_BIT) || xSemaphoreTake(state_lock, 0) != pdTRUE) return false;
+@@ -408,6 +414,58 @@ bool buddy_network_music_control(const char *action, uint32_t value)
+     return accepted;
+ }
+ 
++static void send_nfc_event(void *argument)
++{
++    uint32_t seq = (uint32_t)(uintptr_t)argument;
++    int fd = -1;
++    char uid[24] = "";
++    xSemaphoreTake(state_lock, portMAX_DELAY);
++    int64_t now = esp_timer_get_time();
++    bool valid = nfc_pending_seq == seq && nfc_pending_uid[0] != '\0' &&
++                 nfc_pending_generation == companion_generation &&
++                 nfc_pending_fd == companion_fd && has_report &&
++                 now - last_frame_us <= PC_TIMEOUT_US;
++    if (valid) {
++        fd = nfc_pending_fd;
++        strlcpy(uid, nfc_pending_uid, sizeof(uid));
++        nfc_pending_uid[0] = '\0';
++    }
++    xSemaphoreGive(state_lock);
++    if (!valid || !(xEventGroupGetBits(events) & CONNECTED_BIT) ||
++        httpd_ws_get_fd_info(monitor_server, fd) != HTTPD_WS_CLIENT_WEBSOCKET) return;
++
++    char payload[96];
++    int length = snprintf(payload, sizeof(payload), "{\"type\":\"buddy.nfc\",\"v\":1,\"uid\":\"%s\"}", uid);
++    if (length <= 0 || length >= (int)sizeof(payload)) return;
++    httpd_ws_frame_t frame = {
++        .type = HTTPD_WS_TYPE_TEXT, .payload = (uint8_t *)payload,
++        .len = (size_t)length, .final = true,
++    };
++    if (httpd_ws_send_frame_async(monitor_server, fd, &frame) != ESP_OK) {
++        httpd_sess_trigger_close(monitor_server, fd);
++    }
++}
++
++bool buddy_network_send_nfc(const char *uid_hex)
++{
++    if (!uid_hex || !uid_hex[0] || strlen(uid_hex) >= sizeof(nfc_pending_uid) ||
++        !state_lock || !events || !monitor_server) return false;
++    if (!(xEventGroupGetBits(events) & CONNECTED_BIT)) return false;
++    xSemaphoreTake(state_lock, portMAX_DELAY);
++    int64_t now = esp_timer_get_time();
++    if (companion_fd < 0 || !has_report || now - last_frame_us > PC_TIMEOUT_US) {
++        xSemaphoreGive(state_lock);
++        return false;
++    }
++    ++nfc_pending_seq;
++    uint32_t seq = nfc_pending_seq;
++    nfc_pending_fd = companion_fd;
++    nfc_pending_generation = companion_generation;
++    strlcpy(nfc_pending_uid, uid_hex, sizeof(nfc_pending_uid));
++    xSemaphoreGive(state_lock);
++    return httpd_queue_work(monitor_server, send_nfc_event, (void *)(uintptr_t)seq) == ESP_OK;
++}
++
+ static void close_session(httpd_handle_t server, int fd)
+ {
+     xSemaphoreTake(state_lock, portMAX_DELAY);
+@@ -477,30 +535,40 @@ static esp_err_t websocket_handler(httpd_req_t *request)
+     if (!payload) return ESP_ERR_NO_MEM;
+     frame.payload = payload;
+     result = httpd_ws_recv_frame(request, &frame, frame.len);
+-    buddy_stats_t stats;
+-    if (result == ESP_OK && !buddy_telemetry_parse((const char *)payload, frame.len, &stats)) result = ESP_ERR_INVALID_ARG;
++    buddy_stats_t *stats = calloc(1, sizeof(*stats));
++    if (!stats) {
++        free(payload);
++        return ESP_ERR_NO_MEM;
++    }
++    if (result == ESP_OK && !buddy_telemetry_parse((const char *)payload, frame.len, stats)) result = ESP_ERR_INVALID_ARG;
+     free(payload);
+-    if (result != ESP_OK) return result;
++    if (result != ESP_OK) {
++        free(stats);
++        return result;
++    }
+     xSemaphoreTake(state_lock, portMAX_DELAY);
+     last_frame_us = esp_timer_get_time();
+     has_report = true;
+     music_capabilities = 0;
+-    if (stats.music.running && stats.music.available) {
+-        if (stats.music.can_play_pause) music_capabilities |= MUSIC_PLAY_PAUSE;
+-        if (stats.music.can_next) music_capabilities |= MUSIC_NEXT;
+-        if (stats.music.can_previous) music_capabilities |= MUSIC_PREVIOUS;
+-        if (stats.music.can_shuffle) music_capabilities |= MUSIC_SHUFFLE;
+-        if (stats.music.can_repeat) music_capabilities |= MUSIC_REPEAT;
+-        if (stats.music.can_seek) music_capabilities |= MUSIC_SEEK;
+-        if (stats.music.can_volume) music_capabilities |= MUSIC_VOLUME | MUSIC_MUTE;
++    if (stats->music.running && stats->music.available) {
++        if (stats->music.can_play_pause) music_capabilities |= MUSIC_PLAY_PAUSE;
++        if (stats->music.can_next) music_capabilities |= MUSIC_NEXT;
++        if (stats->music.can_previous) music_capabilities |= MUSIC_PREVIOUS;
++        if (stats->music.can_shuffle) music_capabilities |= MUSIC_SHUFFLE;
++        if (stats->music.can_repeat) music_capabilities |= MUSIC_REPEAT;
++        if (stats->music.can_seek) music_capabilities |= MUSIC_SEEK;
++        if (stats->music.can_volume) music_capabilities |= MUSIC_VOLUME | MUSIC_MUTE;
+     }
+-    if (activity_waiting(&stats.codex.activity) || activity_waiting(&stats.claude.activity)) music_capabilities |= MUSIC_FOCUS;
+-    if (stats.shortcuts.present) music_capabilities |= MUSIC_SHORTCUT;
++    if (activity_waiting(&stats->codex.activity) || stats->codex.activity.item_count > 0 ||
++        activity_waiting(&stats->claude.activity)) music_capabilities |= MUSIC_FOCUS;
++    if (stats->shortcuts.present) music_capabilities |= MUSIC_SHORTCUT;
+     xSemaphoreGive(state_lock);
+-    if (callbacks.on_stats) callbacks.on_stats(&stats);
++    uint64_t seq = stats->sequence;
++    if (callbacks.on_stats) callbacks.on_stats(stats);
++    free(stats);
+     char acknowledgement[96];
+     int acknowledgement_length = snprintf(acknowledgement, sizeof(acknowledgement),
+-        "{\"type\":\"buddy.ack\",\"v\":1,\"seq\":%llu}", (unsigned long long)stats.sequence);
++        "{\"type\":\"buddy.ack\",\"v\":1,\"seq\":%llu}", (unsigned long long)seq);
+     httpd_ws_frame_t reply = {
+         .type = HTTPD_WS_TYPE_TEXT,
+         .payload = (uint8_t *)acknowledgement,
+@@ -597,10 +665,15 @@ static esp_err_t health_handler(httpd_req_t *request)
+     else strlcpy(fps, "null", sizeof(fps));
+     char system[512];
+     system_health(system, sizeof(system));
++    bool nfc_ok = false;
++    uint8_t nfc_ver = 0;
++    char nfc_uid[24] = "";
++    buddy_nfc_get_status(&nfc_ok, &nfc_ver, nfc_uid, sizeof(nfc_uid));
+     char *response = malloc(2304);
+     if (!response) return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "No memory");
+     int length = snprintf(response, 2304,
+         "{\"type\":\"buddy.health\",\"v\":1,\"id\":\"%s\",\"state\":%d,\"version\":\"%s\",\"system\":%s,"
++        "\"nfc\":{\"detected\":%s,\"version\":%u,\"last_uid\":\"%s\"},"
+         "\"ui\":{\"app\":\"%s\",\"automatic\":%s,\"menu_open\":%s,"
+         "\"dimmed\":%s,\"screen_off\":%s,\"night_hours\":%s,\"display_idle_ms\":%lu,"
+         "\"transition\":%s,\"has_stats\":%s,\"auto_open_apps\":%s,\"away\":%s,\"needs_you\":%s,\"install_stage\":%lu,\"last_stats_age_ms\":%lu,"
+@@ -616,6 +689,7 @@ static esp_err_t health_handler(httpd_req_t *request)
+         "\"fetch_state\":\"%s\",\"http_status\":%d,\"response_bytes\":%d,\"fetch_error\":%d,\"tls_error\":%d,\"tls_flags\":%d}}",
+         device_id, (int)published_state,
+         esp_app_get_description()->version, system,
++        nfc_ok ? "true" : "false", (unsigned)nfc_ver, nfc_uid,
+         app_name,
+         (ui_state.offline_automatic || ui_state.music_automatic || ui_state.codex_automatic || ui_state.claude_automatic) ? "true" : "false",
+         ui_state.menu_open ? "true" : "false",
+@@ -987,6 +1061,36 @@ static esp_err_t firmware_post_handler(httpd_req_t *request)
+     return buddy_update_upload(request);
+ }
+ 
++static esp_err_t app_select_handler(httpd_req_t *request)
++{
++    if (require_auth(request) != ESP_OK) return ESP_FAIL;
++    if (request->content_len <= 0 || request->content_len > 64) {
++        return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Invalid app request");
++    }
++    uint8_t *body = read_signed_body(request, 1);
++    if (!body) return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "App request does not match its signature");
++    body[request->content_len] = 0;
++    cJSON *json = cJSON_ParseWithLength((const char *)body, request->content_len + 1);
++    free(body);
++    const cJSON *app_item = json ? cJSON_GetObjectItemCaseSensitive(json, "app") : NULL;
++    int app_id = -1;
++    bool valid = cJSON_IsNumber(app_item) && app_item->valuedouble == app_item->valueint &&
++                 app_item->valueint >= 0 && app_item->valueint < BUDDY_APP_COUNT;
++    if (valid) app_id = app_item->valueint;
++    cJSON_Delete(json);
++    if (!valid) return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Invalid app ID");
++    if (!board_lvgl_lock(1000)) {
++        return httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, BT(BT_DISPLAY_BUSY));
++    }
++    bool selected = buddy_ui_select_app((buddy_app_t)app_id);
++    board_lvgl_unlock();
++    if (!selected) return httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "App unavailable");
++    char reply[48];
++    snprintf(reply, sizeof(reply), "{\"ok\":true,\"app\":%d}", app_id);
++    httpd_resp_set_type(request, "application/json");
++    return httpd_resp_sendstr(request, reply);
++}
++
+ static esp_err_t start_monitor_server(void)
+ {
+     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+@@ -994,7 +1098,7 @@ static esp_err_t start_monitor_server(void)
+     config.ctrl_port = MONITOR_PORT + 1;
+     config.stack_size = 8192;
+     config.max_open_sockets = 4;
+-    config.max_uri_handlers = 14;
++    config.max_uri_handlers = 15;
+     config.lru_purge_enable = true;
+     config.close_fn = close_session;
+     config.recv_wait_timeout = 3;
+@@ -1027,8 +1131,10 @@ static esp_err_t start_monitor_server(void)
+     ESP_RETURN_ON_ERROR(httpd_register_uri_handler(monitor_server, &art), TAG, "Cover URI");
+     const httpd_uri_t shortcuts = {.uri = "/shortcuts", .method = HTTP_POST, .handler = shortcuts_handler};
+     const httpd_uri_t shortcut_icon = {.uri = "/shortcut-icon", .method = HTTP_POST, .handler = shortcut_icon_handler};
++    const httpd_uri_t app_select = {.uri = "/app", .method = HTTP_POST, .handler = app_select_handler};
+     ESP_RETURN_ON_ERROR(httpd_register_uri_handler(monitor_server, &shortcuts), TAG, "Shortcuts URI");
+     ESP_RETURN_ON_ERROR(httpd_register_uri_handler(monitor_server, &shortcut_icon), TAG, "Shortcut icon URI");
++    ESP_RETURN_ON_ERROR(httpd_register_uri_handler(monitor_server, &app_select), TAG, "App select URI");
+     return httpd_register_uri_handler(monitor_server, &snapshot);
+ }
+ 
+diff --git a/firmware/main/network/buddy_network.h b/firmware/main/network/buddy_network.h
+index 69a6b08..383d46b 100644
+--- a/firmware/main/network/buddy_network.h
++++ b/firmware/main/network/buddy_network.h
+@@ -26,3 +26,7 @@ bool buddy_network_music_control(const char *action, uint32_t value);
+ 
+ /* Record the touch-screen answer to a pending confirmation. Safe from the UI task. */
+ void buddy_network_confirm_result(buddy_confirm_action_t action, bool approved);
++
++/* Send a tapped NFC card UID to the connected companion over WebSocket:
++ * {"type":"buddy.nfc","v":1,"uid":"<hex>"}. Safe from any task. */
++bool buddy_network_send_nfc(const char *uid_hex);
+diff --git a/firmware/main/network/buddy_telemetry_parse.c b/firmware/main/network/buddy_telemetry_parse.c
+index 53f597c..19aff7c 100644
+--- a/firmware/main/network/buddy_telemetry_parse.c
++++ b/firmware/main/network/buddy_telemetry_parse.c
+@@ -176,6 +176,7 @@ static bool parse_codex_task(const cJSON *value, buddy_codex_task_t *task)
+           copy_json_string(value, "title", task->title, sizeof(task->title)) &&
+           cJSON_IsString(cJSON_GetObjectItemCaseSensitive(value, "project")) &&
+           copy_json_string(value, "project", task->project, sizeof(task->project)) &&
++          copy_json_string(value, "detail", task->detail, sizeof(task->detail)) &&
+           cJSON_IsString(cJSON_GetObjectItemCaseSensitive(value, "state")) &&
+           copy_json_string(value, "state", task->state, sizeof(task->state)) &&
+           cJSON_IsNumber(cJSON_GetObjectItemCaseSensitive(value, "age_s")) &&
+diff --git a/firmware/main/ui/buddy_ui.c b/firmware/main/ui/buddy_ui.c
+index 1b80042..a28dcfe 100644
+--- a/firmware/main/ui/buddy_ui.c
++++ b/firmware/main/ui/buddy_ui.c
+@@ -25,6 +25,7 @@
+ #include "buddy_weather_page.h"
+ #include "buddy_shortcuts_page.h"
+ #include "buddy_weather_icon.h"
++#include "buddy_weather_animation.h"
+ 
+ /* Broadcast meter bridge: real channels, shared time, restrained state ink. */
+ #define C_BG       BUDDY_COLOR_BG
+@@ -103,6 +104,8 @@ static struct {
+     lv_obj_t *home_page, *game_panel, *game_title, *game_fps, *game_status;
+     lv_obj_t *clock_large, *clock_date, *clock_mascot;
+     lv_obj_t *weather_row, *weather_icon, *weather_text, *weather_note;
++    lv_obj_t *clock_weather_card, *clock_temp, *clock_cond, *clock_hi_lo, *clock_wind_hum, *clock_precip;
++    lv_obj_t *clock_fc_time[4], *clock_fc_icon[4], *clock_fc_temp[4], *clock_fc_rain[4], *clock_fc_bar[4];
+     buddy_weather_t weather;
+     lv_obj_t *music_page, *music_logo, *music_heading, *music_status, *music_eq, *music_eq_bars[3];
+     lv_obj_t *music_cover, *music_rings[2], *music_buddy, *music_meta, *music_title, *music_artist, *music_album;
+@@ -156,10 +159,22 @@ static struct {
+     buddy_confirm_action_t confirm_action;
+     uint32_t confirm_started;
+     char confirm_detail[BUDDY_CONFIRM_DETAIL_SIZE], install_detail[BUDDY_CONFIRM_DETAIL_SIZE];
+-    /* The approval prompt, and the alert while a Codex or Claude task waits for the user. */
++    /* The approval prompt, and the alert while a Claude task waits for the user. */
+     prompt_view_t confirm, alert;
+     buddy_app_t alert_app;
+     char alert_key[112], alert_dismissed[112];
++    /* Non-intrusive flashing red Amp badge in the corner -> full-screen grid of waiting threads. */
++    lv_obj_t *amp_badge, *amp_badge_dot, *amp_badge_label;
++    lv_obj_t *amp_inbox_page, *amp_inbox_dot, *amp_inbox_title, *amp_inbox_sub;
++    lv_obj_t *amp_cards[BUDDY_CODEX_MAX_TASKS];
++    lv_obj_t *amp_card_dots[BUDDY_CODEX_MAX_TASKS];
++    lv_obj_t *amp_card_projects[BUDDY_CODEX_MAX_TASKS];
++    lv_obj_t *amp_card_ages[BUDDY_CODEX_MAX_TASKS];
++    lv_obj_t *amp_card_titles[BUDDY_CODEX_MAX_TASKS];
++    lv_obj_t *amp_card_details[BUDDY_CODEX_MAX_TASKS];
++    uint32_t amp_card_item_idx[BUDDY_CODEX_MAX_TASKS];
++    uint32_t amp_waiting_count;
++    bool amp_inbox_open;
+     /* A Wi-Fi firmware install in progress. */
+     lv_obj_t *install_page, *install_title, *install_version, *install_track, *install_fill, *install_mascot;
+     lv_obj_t *install_percent, *install_stage_label, *install_note;
+@@ -223,6 +238,9 @@ static bool claude_tasks_stale(void);
+ static void refresh_home(void);
+ static void refresh_game(void);
+ static void refresh_alert(void);
++static void refresh_amp_inbox(void);
++static void close_amp_inbox(void);
++static void create_amp_badge(void);
+ 
+ /* A PC that is connected and not locked or asleep. */
+ static bool pc_live(void)
+@@ -237,6 +255,7 @@ static void dismiss_startup(void)
+     ui.startup = NULL;
+     ui.startup_mascot = NULL;
+     lv_img_cache_invalidate_src(&ui.startup_frame);
++    refresh_amp_inbox();
+ }
+ 
+ static buddy_settings_t view_settings = {.enabled_apps = 511, .weather_enabled = true, .dim_behavior = 1, .dim_after_seconds = 60, .dim_brightness = 40, .night_enabled = true, .night_start = 1, .night_end = 10, .offline_app = 1};
+@@ -362,7 +381,7 @@ static void refresh_display_power(void)
+     ui.power_tick = now;
+     bool connected = pc_live();
+     if ((connected && view_settings.dim_behavior != 2) || touched != ui.last_touch_tick || ui.wake_touch_active ||
+-        ui.confirm_action != BUDDY_CONFIRM_NONE || ui.alert_key[0] || ui.install_stage != BUDDY_INSTALL_NONE) {
++        ui.confirm_action != BUDDY_CONFIRM_NONE || ui.alert_key[0] || ui.amp_inbox_open || ui.install_stage != BUDDY_INSTALL_NONE) {
+         ui.idle_ms = 0;
+     } else {
+         /* Saturation prevents a long unattended run from waking at tick wrap. */
+@@ -664,6 +683,9 @@ static buddy_mascot_state_t mascot_state(void)
+         return music_connected() && ui.stats.claude.running ? BUDDY_MASCOT_TYPING : BUDDY_MASCOT_IDLE;
+     }
+     if (ui.active_app == BUDDY_APP_CLOCK) {
++        if (view_settings.weather_enabled && ui.weather.available) {
++            return BUDDY_WEATHER_ANIMATION(ui.weather.code, ui.weather.is_day);
++        }
+         const bool pc_available = ui.connection == BUDDY_PC_CONNECTED && ui.have_stats &&
+                                   lv_tick_elaps(ui.last_stats_tick) < CLOCK_DELAY_MS;
+         return pc_available ? BUDDY_MASCOT_IDLE : BUDDY_MASCOT_SLEEPING;
+@@ -768,6 +790,35 @@ static void mascot_tick(lv_timer_t *timer)
+     }
+     if (ui.alert_key[0] && ui.alert.tile)
+         lv_obj_set_style_border_opa(ui.alert.tile, (lv_tick_get() / 600U) % 2U ? LV_OPA_COVER : LV_OPA_20, 0);
++    /* Smooth flashing red corner badge when Amp has threads waiting for you. */
++    if (ui.amp_badge && !lv_obj_has_flag(ui.amp_badge, LV_OBJ_FLAG_HIDDEN)) {
++        uint32_t t = lv_tick_get() % 1100U;
++        uint32_t tri = t < 550U ? t : (1100U - t);
++        lv_opa_t dot_opa = (lv_opa_t)(LV_OPA_30 + (tri * (LV_OPA_COVER - LV_OPA_30)) / 550U);
++        lv_opa_t border_opa = (lv_opa_t)(LV_OPA_40 + (tri * (LV_OPA_COVER - LV_OPA_40)) / 550U);
++        lv_obj_set_style_bg_opa(ui.amp_badge_dot, dot_opa, 0);
++        lv_obj_set_style_border_opa(ui.amp_badge, border_opa, 0);
++    }
++    /* Each Amp waiting card in the grid flashes independently on its own period & phase. */
++    if (ui.amp_inbox_open && ui.amp_inbox_page) {
++        static const uint32_t periods[BUDDY_CODEX_MAX_TASKS] = { 620, 790, 930, 680, 850, 740, 990, 710 };
++        static const uint32_t phases[BUDDY_CODEX_MAX_TASKS]  = { 0, 210, 470, 120, 360, 580, 190, 430 };
++        uint32_t now = lv_tick_get();
++        if (ui.amp_inbox_dot) {
++            uint32_t ht = now % 1000U;
++            uint32_t htri = ht < 500U ? ht : (1000U - ht);
++            lv_obj_set_style_bg_opa(ui.amp_inbox_dot, (lv_opa_t)(LV_OPA_30 + (htri * (LV_OPA_COVER - LV_OPA_30)) / 500U), 0);
++        }
++        for (unsigned i = 0; i < ui.amp_waiting_count && i < BUDDY_CODEX_MAX_TASKS; ++i) {
++            uint32_t p = periods[i];
++            uint32_t t = (now + phases[i]) % (p * 2U);
++            uint32_t tri = t < p ? t : (p * 2U - t);
++            lv_opa_t dot_opa = (lv_opa_t)(LV_OPA_20 + (tri * (LV_OPA_COVER - LV_OPA_20)) / p);
++            lv_opa_t border_opa = (lv_opa_t)(LV_OPA_20 + (tri * (LV_OPA_COVER - LV_OPA_20)) / p);
++            lv_obj_set_style_bg_opa(ui.amp_card_dots[i], dot_opa, 0);
++            lv_obj_set_style_border_opa(ui.amp_cards[i], border_opa, 0);
++        }
++    }
+     if (buddy_theme_has_mascot()) feed_mascot();
+ }
+ 
+@@ -871,9 +922,12 @@ static void refresh_visibility(void)
+     lv_obj_set_style_opa(ui.apps_button, need_setup ? LV_OPA_50 : LV_OPA_COVER, 0);
+     if (!ui.menu_open) for (unsigned i = 0; i < BUDDY_APP_COUNT; ++i) buddy_ui_motion_cancel(ui.app_rows[i]);
+     chooser_layout();
+-    visible(ui.weather_row, view_settings.weather_enabled);
++    visible(ui.weather_row, view_settings.weather_enabled && BOARD_DISPLAY_WIDTH < 800);
+     visible(ui.weather_note, view_settings.weather_enabled);
++    if (ui.clock_weather_card) visible(ui.clock_weather_card, view_settings.weather_enabled && BOARD_DISPLAY_WIDTH >= 800);
++    if (ui.weather_icon && BOARD_DISPLAY_WIDTH >= 800) visible(ui.weather_icon, view_settings.weather_enabled && ui.weather.available);
+     refresh_activity();
++    refresh_amp_inbox();
+     refresh_display_power();
+ }
+ 
+@@ -1033,7 +1087,7 @@ static void begin_app_transition(void)
+     ui.mascot_state = BUDDY_MASCOT_STATE_COUNT;
+     if (!ui.startup) update_large_frame(&buddy_mascot_frames[ui.transition_mascot][0]);
+     lv_obj_t *actor = ui.active_app == BUDDY_APP_CLOCK ? ui.clock_mascot : ui.app_transition;
+-    int end_y = BOARD_DISPLAY_WIDTH<800 ? (ui.active_app==BUDDY_APP_CLOCK ? (BOARD_DISPLAY_HEIGHT<400?96:286) : BOARD_DISPLAY_HEIGHT-148) : (ui.active_app == BUDDY_APP_CLOCK ? 316 : 336);
++    int end_y = BOARD_DISPLAY_WIDTH<800 ? (ui.active_app==BUDDY_APP_CLOCK ? (BOARD_DISPLAY_HEIGHT<400?96:286) : BOARD_DISPLAY_HEIGHT-148) : (ui.active_app == BUDDY_APP_CLOCK ? 92 : 336);
+     lv_anim_del(ui.clock_mascot, mascot_set_y);
+     lv_anim_del(ui.app_transition, mascot_set_y);
+     lv_anim_t anim;
+@@ -1260,12 +1314,12 @@ static void create_channel(channel_t *channel, const char *name, bool gpu)
+     channel->usage = lv_label_create(channel->gauge);
+     lv_label_set_text(channel->usage, "--");
+     channel->usage_caption = lv_label_create(channel->gauge);
+-    lv_label_set_text(channel->usage_caption, BT(BT_LOAD));
++    lv_label_set_text(channel->usage_caption, gpu ? "% used" : BT(BT_LOAD));
+     lv_obj_set_style_text_font(channel->usage_caption, &buddy_language_font_14, 0);
+     lv_obj_set_style_text_color(channel->usage_caption, color(C_MUTED), 0);
+     channel->name = text(channel->button, name, 0, 0, 100, &buddy_language_font_20, C_TEXT);
+     channel->temperature = text(channel->button, "--", 0, 0, 100, &buddy_language_font_32, C_TEXT);
+-    channel->temperature_caption = text(channel->button, BT(BT_TEMPERATURE), 0, 0, 100, &buddy_language_font_14, C_MUTED);
++    channel->temperature_caption = text(channel->button, gpu ? "Free" : BT(BT_TEMPERATURE), 0, 0, 100, &buddy_language_font_14, C_MUTED);
+     channel->model = text(channel->button, BT(BT_WAITING_FOR_SENSORS), 0, 0, 100, &buddy_language_font_14, C_MUTED);
+ }
+ 
+@@ -2051,6 +2105,14 @@ static void agent_tab_clicked(lv_event_t *event)
+     buddy_ui_motion_enter(tasks ? view->tasks_body : view->usage_body, 6, 180, 0);
+ }
+ 
++static void amp_task_row_clicked(lv_event_t *event)
++{
++    uint32_t idx = (uint32_t)(uintptr_t)lv_event_get_user_data(event);
++    if (ui.music_control_callback && idx < BUDDY_CODEX_MAX_TASKS) {
++        ui.music_control_callback("focus", 100U + idx);
++    }
++}
++
+ static void create_agent_page(agent_view_t *view, const buddy_codex_t *data, const agent_copy_t *copy)
+ {
+     view->data = data;
+@@ -2131,6 +2193,11 @@ static void create_agent_page(agent_view_t *view, const buddy_codex_t *data, con
+     view->tasks_body = box(view->page, 28, 100, 548, 300);
+     for (unsigned i = 0; i < 3; ++i) {
+         view->task_rows[i] = surface_card(view->tasks_body, 14);
++        if (view == &ui.codex) {
++            lv_obj_add_flag(view->task_rows[i], LV_OBJ_FLAG_CLICKABLE);
++            lv_obj_set_style_bg_color(view->task_rows[i], color(C_PRESSED), LV_STATE_PRESSED);
++            lv_obj_add_event_cb(view->task_rows[i], amp_task_row_clicked, LV_EVENT_CLICKED, (void *)(uintptr_t)i);
++        }
+         view->task_dots[i] = box(view->task_rows[i], 0, 0, 10, 10);
+         lv_obj_set_style_radius(view->task_dots[i], LV_RADIUS_CIRCLE, 0);
+         lv_obj_set_style_bg_opa(view->task_dots[i], LV_OPA_COVER, 0);
+@@ -2612,35 +2679,115 @@ static void create_timer_page(void)
+ static void draw_weather_icon(lv_event_t *event)
+ {
+     if (!ui.weather.available) return;
++    lv_obj_t *target = lv_event_get_target(event);
+     lv_area_t area;
+-    lv_obj_get_coords(lv_event_get_target(event), &area);
+-    int scale = lv_obj_get_width(lv_event_get_target(event)) >= 56 ? 2 : 1;
++    lv_obj_get_coords(target, &area);
++    int w = lv_obj_get_width(target);
++    int scale = w >= 104 ? 4 : w >= 78 ? 3 : w >= 52 ? 2 : 1;
+     buddy_weather_icon_draw(lv_event_get_draw_ctx(event), area.x1, area.y1, scale, ui.weather.code, ui.weather.is_day,
+                             ui.active_app == BUDDY_APP_HOME ? BUDDY_COLOR_BG : C_CLOCK_BG);
+ }
+ 
++static void draw_clock_fc_icon(lv_event_t *event)
++{
++    lv_obj_t *target = lv_event_get_target(event);
++    intptr_t packed = (intptr_t)lv_obj_get_user_data(target);
++    if (packed < 0) return;
++    lv_area_t area;
++    lv_obj_get_coords(target, &area);
++    buddy_weather_icon_draw(lv_event_get_draw_ctx(event), area.x1, area.y1, 2, (int)(packed / 2), (packed % 2) != 0,
++                            BUDDY_COLOR_SURFACE);
++}
++
+ static void create_app_surfaces(void)
+ {
+     ui.home_page = buddy_home_create(ui.screen, activity_clicked, draw_weather_icon);
+     ui.clock_page = box(ui.screen, 0, 0, 800, 440);
+     lv_obj_set_style_bg_color(ui.clock_page, color(C_CLOCK_BG), 0);
+     lv_obj_set_style_bg_opa(ui.clock_page, LV_OPA_COVER, 0);
+-    ui.clock_large = text(ui.clock_page, "--:--", 60, 145, 680, &buddy_clock_font, C_CLOCK_TEXT);
+-    lv_obj_set_style_text_align(ui.clock_large, LV_TEXT_ALIGN_CENTER, 0);
+-    ui.clock_date = text(ui.clock_page, "", 80, 251, 640, &buddy_language_font_24, C_CLOCK_DATE);
+-    lv_obj_set_style_text_align(ui.clock_date, LV_TEXT_ALIGN_CENTER, 0);
+-    ui.weather_row = box(ui.clock_page, 28, 290, 744, 26);
+-    ui.weather_icon = box(ui.weather_row, 0, 0, 28, 26);
+-    lv_obj_add_event_cb(ui.weather_icon, draw_weather_icon, LV_EVENT_DRAW_MAIN, NULL);
+-    ui.weather_text = text(ui.weather_row, BT(BT_WEATHER_LOADING), 0, 1, 744,
+-                           &buddy_language_font_20, C_CLOCK_DATE);
+-    ui.weather_note = text(ui.clock_page, "", 28, 418, 744,
+-                           &buddy_language_font_14, C_CLOCK_DATE);
+-    lv_obj_set_style_text_align(ui.weather_note, LV_TEXT_ALIGN_CENTER, 0);
+-    ui.clock_mascot = lv_img_create(ui.clock_page);
+-    lv_obj_set_pos(ui.clock_mascot, 352, 316);
+-    lv_img_set_antialias(ui.clock_mascot, false);
+-    lv_obj_clear_flag(ui.clock_mascot, LV_OBJ_FLAG_CLICKABLE);
++    if (BOARD_DISPLAY_WIDTH >= 800) {
++        /* Wide desk-clock layout: hero time + date on left, weather-dressed Teddy + 104px color graphic on right,
++         * and a clickable live weather + 4-slot upcoming forecast card across the bottom half. */
++        ui.clock_large = text(ui.clock_page, "--:--", 32, 18, 500, &buddy_clock_font, C_CLOCK_TEXT);
++        ui.clock_date = text(ui.clock_page, "", 36, 126, 490, &buddy_language_font_24, C_CLOCK_DATE);
++        ui.weather_note = text(ui.clock_page, "", 36, 162, 490, &buddy_language_font_16, C_CLOCK_DATE);
++
++        ui.clock_mascot = lv_img_create(ui.clock_page);
++        lv_obj_set_pos(ui.clock_mascot, 548, 92);
++        lv_img_set_antialias(ui.clock_mascot, false);
++        lv_obj_clear_flag(ui.clock_mascot, LV_OBJ_FLAG_CLICKABLE);
++
++        ui.weather_icon = box(ui.clock_page, 660, 74, 104, 104);
++        lv_obj_add_event_cb(ui.weather_icon, draw_weather_icon, LV_EVENT_DRAW_MAIN, NULL);
++        lv_obj_add_flag(ui.weather_icon, LV_OBJ_FLAG_HIDDEN);
++
++        /* Compact-only row kept hidden on 800px so shared helpers stay safe. */
++        ui.weather_row = box(ui.clock_page, 0, 0, 1, 1);
++        lv_obj_add_flag(ui.weather_row, LV_OBJ_FLAG_HIDDEN);
++        ui.weather_text = text(ui.weather_row, "", 0, 0, 1, &buddy_language_font_14, C_CLOCK_DATE);
++
++        ui.clock_weather_card = surface_card(ui.clock_page, 16);
++        lv_obj_set_pos(ui.clock_weather_card, 28, 206);
++        lv_obj_set_size(ui.clock_weather_card, 744, 214);
++        lv_obj_add_flag(ui.clock_weather_card, LV_OBJ_FLAG_CLICKABLE);
++        lv_obj_set_style_bg_color(ui.clock_weather_card, color(C_PRESSED), LV_STATE_PRESSED);
++        lv_obj_add_event_cb(ui.clock_weather_card, activity_clicked, LV_EVENT_CLICKED, (void *)(uintptr_t)BUDDY_APP_WEATHER);
++
++        ui.clock_temp = text(ui.clock_weather_card, "--", 22, 16, 224, &buddy_language_font_48, C_TEXT);
++        ui.clock_cond = text(ui.clock_weather_card, BT(BT_WEATHER_LOADING), 22, 74, 228, &buddy_language_font_20, C_ACCENT);
++        ui.clock_hi_lo = text(ui.clock_weather_card, "", 22, 112, 232, &buddy_language_font_16, C_TEXT);
++        ui.clock_wind_hum = text(ui.clock_weather_card, "", 22, 144, 232, &buddy_language_font_14, C_MUTED);
++        ui.clock_precip = text(ui.clock_weather_card, "Tap for full forecast", 22, 174, 232, &buddy_language_font_14, C_MUTED);
++
++        rule(ui.clock_weather_card, 262, 20, 1, 174);
++
++        for (unsigned i = 0; i < 4; ++i) {
++            int cx = 278 + (int)i * 114;
++            ui.clock_fc_time[i] = text(ui.clock_weather_card, "", cx, 18, 106, &buddy_language_font_16, C_MUTED);
++            lv_obj_set_style_text_align(ui.clock_fc_time[i], LV_TEXT_ALIGN_CENTER, 0);
++
++            ui.clock_fc_icon[i] = box(ui.clock_weather_card, cx + 27, 46, 52, 52);
++            lv_obj_set_user_data(ui.clock_fc_icon[i], (void *)(intptr_t)-1);
++            lv_obj_add_event_cb(ui.clock_fc_icon[i], draw_clock_fc_icon, LV_EVENT_DRAW_MAIN, NULL);
++
++            ui.clock_fc_temp[i] = text(ui.clock_weather_card, "--", cx, 108, 106, &buddy_language_font_24, C_TEXT);
++            lv_obj_set_style_text_align(ui.clock_fc_temp[i], LV_TEXT_ALIGN_CENTER, 0);
++
++            ui.clock_fc_rain[i] = text(ui.clock_weather_card, "", cx, 146, 106, &buddy_language_font_14, 0x5EB5F7);
++            lv_obj_set_style_text_align(ui.clock_fc_rain[i], LV_TEXT_ALIGN_CENTER, 0);
++
++            ui.clock_fc_bar[i] = lv_bar_create(ui.clock_weather_card);
++            lv_obj_remove_style_all(ui.clock_fc_bar[i]);
++            lv_obj_set_pos(ui.clock_fc_bar[i], cx + 21, 174);
++            lv_obj_set_size(ui.clock_fc_bar[i], 64, 5);
++            lv_bar_set_range(ui.clock_fc_bar[i], 0, 100);
++            lv_obj_set_style_radius(ui.clock_fc_bar[i], LV_RADIUS_CIRCLE, LV_PART_MAIN);
++            lv_obj_set_style_radius(ui.clock_fc_bar[i], LV_RADIUS_CIRCLE, LV_PART_INDICATOR);
++            lv_obj_set_style_bg_color(ui.clock_fc_bar[i], color(C_RULE), LV_PART_MAIN);
++            lv_obj_set_style_bg_opa(ui.clock_fc_bar[i], LV_OPA_COVER, LV_PART_MAIN);
++            lv_obj_set_style_bg_color(ui.clock_fc_bar[i], color(0x4DA6FF), LV_PART_INDICATOR);
++            lv_obj_set_style_bg_opa(ui.clock_fc_bar[i], LV_OPA_COVER, LV_PART_INDICATOR);
++            lv_obj_clear_flag(ui.clock_fc_bar[i], LV_OBJ_FLAG_CLICKABLE);
++            visible(ui.clock_fc_bar[i], false);
++        }
++    } else {
++        ui.clock_large = text(ui.clock_page, "--:--", 60, 145, 680, &buddy_clock_font, C_CLOCK_TEXT);
++        lv_obj_set_style_text_align(ui.clock_large, LV_TEXT_ALIGN_CENTER, 0);
++        ui.clock_date = text(ui.clock_page, "", 80, 251, 640, &buddy_language_font_24, C_CLOCK_DATE);
++        lv_obj_set_style_text_align(ui.clock_date, LV_TEXT_ALIGN_CENTER, 0);
++        ui.weather_row = box(ui.clock_page, 28, 290, 744, 26);
++        ui.weather_icon = box(ui.weather_row, 0, 0, 28, 26);
++        lv_obj_add_event_cb(ui.weather_icon, draw_weather_icon, LV_EVENT_DRAW_MAIN, NULL);
++        ui.weather_text = text(ui.weather_row, BT(BT_WEATHER_LOADING), 0, 1, 744,
++                               &buddy_language_font_20, C_CLOCK_DATE);
++        ui.weather_note = text(ui.clock_page, "", 28, 418, 744,
++                               &buddy_language_font_14, C_CLOCK_DATE);
++        lv_obj_set_style_text_align(ui.weather_note, LV_TEXT_ALIGN_CENTER, 0);
++        ui.clock_mascot = lv_img_create(ui.clock_page);
++        lv_obj_set_pos(ui.clock_mascot, 352, 316);
++        lv_img_set_antialias(ui.clock_mascot, false);
++        lv_obj_clear_flag(ui.clock_mascot, LV_OBJ_FLAG_CLICKABLE);
++    }
+ 
+     ui.weather_page = buddy_weather_page_create(ui.screen);
+     ui.shortcuts_page = buddy_shortcuts_page_create(ui.screen);
+@@ -2890,6 +3037,7 @@ void buddy_ui_init(void)
+     select_channel(false);
+     refresh_connection();
+     ui.history_timer = lv_timer_create(history_tick, 1000, NULL);
++    create_amp_badge();
+     create_startup();
+     lv_scr_load(ui.screen);
+     /* Global shade; it captures only the first wake gesture when fully off. */
+@@ -2922,6 +3070,7 @@ void buddy_ui_set_connection(buddy_connection_state_t state, const char *ssid,
+     /* Away only explains a quiet PC; it ends when Wi-Fi itself is gone. */
+     if (state != BUDDY_PC_CONNECTED && state != BUDDY_PC_OFFLINE) ui.pc_away = false;
+     if (state != BUDDY_PC_CONNECTED && ui.alert_key[0]) { ui.alert_key[0] = 0; visible(ui.alert.page, false); }
++    if (state != BUDDY_PC_CONNECTED) { close_amp_inbox(); if (ui.amp_badge) visible(ui.amp_badge, false); }
+     if (state == BUDDY_PROVISIONING) {
+         /* Setup instructions always remain accessible, including after Clock. */
+         dismiss_startup();
+@@ -3046,6 +3195,16 @@ void buddy_ui_update_stats(const buddy_stats_t *stats)
+     lv_label_set_text(ui.host, stats->hostname[0] ? stats->hostname : BT(BT_PAIRED_PC));
+     channel_reading(&ui.cpu, stats->cpu_usage, stats->cpu_temperature, stats->cpu_name);
+     channel_reading(&ui.gpu, stats->gpu_usage, stats->gpu_temperature, stats->gpu_name);
++    /* Show free disk space in the Disk card's large readout when storage totals are reported. */
++    if (!isfinite(stats->gpu_temperature) && isfinite(stats->vram_used_mb) && isfinite(stats->vram_total_mb) && stats->vram_total_mb > 0) {
++        float free_gb = fmaxf(stats->vram_total_mb - stats->vram_used_mb, 0.f) / 1024.f;
++        char free_buf[32];
++        if (free_gb >= 1000.f) snprintf(free_buf, sizeof(free_buf), "%.1f TB", free_gb / 1024.f);
++        else snprintf(free_buf, sizeof(free_buf), "%.0f GB", free_gb);
++        lv_label_set_text(ui.gpu.temperature, free_buf);
++        lv_obj_set_style_text_color(ui.gpu.temperature,
++            color(ui.connection != BUDDY_PC_CONNECTED ? C_MUTED : free_gb < 20.f ? C_WARNING : C_TEXT), 0);
++    }
+     memory_reading(ui.memory, stats->memory_used_mb, stats->memory_total_mb);
+     memory_reading(ui.vram, stats->vram_used_mb, stats->vram_total_mb);
+     char buf[64];
+@@ -3075,6 +3234,7 @@ void buddy_ui_update_stats(const buddy_stats_t *stats)
+     if (away_changed) refresh_connection();
+     maybe_auto_app();
+     refresh_alert();
++    refresh_amp_inbox();
+     refresh_footer();
+     refresh_visibility();
+ }
+@@ -3116,10 +3276,10 @@ void buddy_ui_set_weather(const buddy_weather_t *weather)
+     ui.weather = *weather;
+     buddy_weather_page_update(weather);
+     refresh_home();
+-    if (strcmp(lv_label_get_text(ui.weather_text), reading) != 0) {
++    if (BOARD_DISPLAY_WIDTH < 800 && strcmp(lv_label_get_text(ui.weather_text), reading) != 0) {
+         lv_label_set_text(ui.weather_text, reading);
+         lv_point_t size;
+-        const lv_font_t *font=BOARD_DISPLAY_WIDTH<800?&buddy_language_font_16:&buddy_language_font_20;
++        const lv_font_t *font=&buddy_language_font_16;
+         lv_obj_set_style_text_font(ui.weather_text,font,0);
+         lv_txt_get_size(&size, reading, font, 0, 0, 700, LV_TEXT_FLAG_NONE);
+         int icon_width = weather->available ? 38 : 0;
+@@ -3132,14 +3292,115 @@ void buddy_ui_set_weather(const buddy_weather_t *weather)
+     }
+     if (strcmp(lv_label_get_text(ui.weather_note), note) != 0)
+         lv_label_set_text(ui.weather_note, note);
+-    visible(ui.weather_icon, weather->available);
++    visible(ui.weather_icon, view_settings.weather_enabled && weather->available);
+     if (changed_icon) lv_obj_invalidate(ui.weather_icon);
++
++    /* Populate the rich Clock weather summary & 4-slot upcoming forecast card on 800px screens. */
++    if (ui.clock_weather_card) {
++        if (weather->available) {
++            char tbuf[24], line[96];
++            buddy_weather_format_temperature(tbuf, sizeof(tbuf), weather->temperature_c, view_settings.weather_fahrenheit);
++            set_label_if_changed(ui.clock_temp, tbuf);
++            const char *desc = buddy_weather_description(weather->code, weather->is_day);
++            set_label_if_changed(ui.clock_cond, desc ? desc : BT(BT_WEATHER));
++
++            char hi[20] = "--", lo[20] = "--", feels[20] = "--";
++            if (weather->daily_count > 0) {
++                buddy_weather_format_temperature(hi, sizeof(hi), weather->days[0].high_c, view_settings.weather_fahrenheit);
++                buddy_weather_format_temperature(lo, sizeof(lo), weather->days[0].low_c, view_settings.weather_fahrenheit);
++            }
++            buddy_weather_format_temperature(feels, sizeof(feels), weather->feels_like_c, view_settings.weather_fahrenheit);
++            if (weather->daily_count > 0 && isfinite(weather->feels_like_c))
++                snprintf(line, sizeof(line), "H %s  L %s  \xC2\xB7  Feels %s", hi, lo, feels);
++            else if (isfinite(weather->feels_like_c))
++                snprintf(line, sizeof(line), "Feels like %s", feels);
++            else
++                line[0] = '\0';
++            set_label_if_changed(ui.clock_hi_lo, line);
++
++            if (isfinite(weather->wind_kmh) && isfinite(weather->humidity_percent)) {
++                if (view_settings.weather_fahrenheit)
++                    snprintf(line, sizeof(line), "Wind %.0f mph  \xC2\xB7  %.0f%% hum", weather->wind_kmh * 0.621371f, weather->humidity_percent);
++                else
++                    snprintf(line, sizeof(line), "Wind %.0f km/h  \xC2\xB7  %.0f%% hum", weather->wind_kmh, weather->humidity_percent);
++            } else if (isfinite(weather->humidity_percent)) {
++                snprintf(line, sizeof(line), "Humidity %.0f%%", weather->humidity_percent);
++            } else {
++                line[0] = '\0';
++            }
++            set_label_if_changed(ui.clock_wind_hum, line);
++
++            if (isfinite(weather->precipitation_mm) && weather->precipitation_mm >= 0.05f)
++                snprintf(line, sizeof(line), "Rain %.1f mm  \xC2\xB7  Tap for forecast", weather->precipitation_mm);
++            else
++                snprintf(line, sizeof(line), "Tap for 5-day forecast");
++            set_label_if_changed(ui.clock_precip, line);
++
++            /* Pick 4 upcoming forecast slots spaced 3 hours apart (+2h, +5h, +8h, +11h). */
++            int64_t now_ts = wall_clock();
++            unsigned base = 0;
++            while (base < weather->hourly_count && now_ts > 0 && weather->hours[base].timestamp < now_ts + 1800) {
++                ++base;
++            }
++            for (unsigned i = 0; i < 4; ++i) {
++                unsigned idx = base + i * 3U;
++                bool ok = idx < weather->hourly_count;
++                visible(ui.clock_fc_time[i], ok);
++                visible(ui.clock_fc_icon[i], ok);
++                visible(ui.clock_fc_temp[i], ok);
++                visible(ui.clock_fc_rain[i], ok);
++                visible(ui.clock_fc_bar[i], ok);
++                if (!ok) continue;
++                const buddy_weather_hour_t *hr = &weather->hours[idx];
++                time_t ts = (time_t)hr->timestamp;
++                struct tm local;
++                localtime_r(&ts, &local);
++                char htxt[16];
++                if (view_settings.use_24h)
++                    snprintf(htxt, sizeof(htxt), "%02d:00", local.tm_hour);
++                else {
++                    int h12 = local.tm_hour % 12;
++                    snprintf(htxt, sizeof(htxt), "%d%s", h12 ? h12 : 12, local.tm_hour < 12 ? "a" : "p");
++                }
++                set_label_if_changed(ui.clock_fc_time[i], htxt);
++
++                intptr_t packed = (intptr_t)hr->code * 2 + (hr->is_day ? 1 : 0);
++                if ((intptr_t)lv_obj_get_user_data(ui.clock_fc_icon[i]) != packed) {
++                    lv_obj_set_user_data(ui.clock_fc_icon[i], (void *)packed);
++                    lv_obj_invalidate(ui.clock_fc_icon[i]);
++                }
++
++                buddy_weather_format_temperature(tbuf, sizeof(tbuf), hr->temperature_c, view_settings.weather_fahrenheit);
++                set_label_if_changed(ui.clock_fc_temp[i], tbuf);
++
++                int pop = isfinite(hr->precipitation_probability) ? (int)lroundf(fminf(fmaxf(hr->precipitation_probability, 0.f), 100.f)) : 0;
++                char ptxt[16];
++                snprintf(ptxt, sizeof(ptxt), "%d%%", pop);
++                set_label_if_changed(ui.clock_fc_rain[i], ptxt);
++                lv_bar_set_value(ui.clock_fc_bar[i], pop, LV_ANIM_OFF);
++            }
++        } else {
++            set_label_if_changed(ui.clock_temp, "--");
++            set_label_if_changed(ui.clock_cond, weather->failed || weather->age_s ? BT(BT_WEATHER_UNAVAILABLE) : BT(BT_WEATHER_LOADING));
++            set_label_if_changed(ui.clock_hi_lo, "");
++            set_label_if_changed(ui.clock_wind_hum, "");
++            set_label_if_changed(ui.clock_precip, "");
++            for (unsigned i = 0; i < 4; ++i) {
++                visible(ui.clock_fc_time[i], false);
++                visible(ui.clock_fc_icon[i], false);
++                visible(ui.clock_fc_temp[i], false);
++                visible(ui.clock_fc_rain[i], false);
++                visible(ui.clock_fc_bar[i], false);
++            }
++        }
++    }
+ }
+ 
+ bool buddy_ui_select_app(buddy_app_t app)
+ {
+     if (!ui.screen || !app_enabled(app)) return false;
+     if (app != BUDDY_APP_MONITOR && ui.connection == BUDDY_PROVISIONING) return false;
++    close_amp_inbox();
+     ui.menu_open = false;
+     ui.offline_handled = ui.connection != BUDDY_PC_CONNECTED;
+     ui.pc_launch_pending = false;
+@@ -3214,9 +3475,11 @@ static prompt_metrics_t prompt_metrics(void)
+ 
+ #define PROMPT_LOGO 32
+ 
+-/* Overlays stack by urgency: an install above an approval above an alert, the dim shield above all. */
++/* Overlays stack by urgency: Amp badge -> Amp inbox grid -> Claude alert -> approval -> install -> dim shield. */
+ static void raise_overlays(void)
+ {
++    if (ui.amp_badge && !lv_obj_has_flag(ui.amp_badge, LV_OBJ_FLAG_HIDDEN)) lv_obj_move_foreground(ui.amp_badge);
++    if (ui.amp_inbox_page && ui.amp_inbox_open) lv_obj_move_foreground(ui.amp_inbox_page);
+     if (ui.alert.page && ui.alert_key[0]) lv_obj_move_foreground(ui.alert.page);
+     if (ui.confirm.page && ui.confirm_action != BUDDY_CONFIRM_NONE) lv_obj_move_foreground(ui.confirm.page);
+     if (ui.install_page && ui.install_stage != BUDDY_INSTALL_NONE) lv_obj_move_foreground(ui.install_page);
+@@ -3380,15 +3643,11 @@ static void ago_text(char *buffer, size_t size, uint32_t seconds)
+     else snprintf(buffer, size, BT(BT_LU_H_AGO), (unsigned long)(seconds / 3600));
+ }
+ 
+-/* Shows the alert over any app while a task waits; the first tap is the user's choice. */
++/* Shows the full-screen alert for Claude Code; Amp uses the two-step flashing corner badge -> card grid. */
+ static void refresh_alert(void)
+ {
+-    const buddy_codex_t *agents[] = { &ui.stats.claude, &ui.stats.codex };
+-    const buddy_app_t apps[] = { BUDDY_APP_CLAUDE, BUDDY_APP_CODEX };
+-    const buddy_codex_task_t *task = NULL;
++    const buddy_codex_task_t *task = music_connected() ? waiting_task(&ui.stats.claude) : NULL;
+     buddy_app_t app = BUDDY_APP_CLAUDE;
+-    for (unsigned i = 0; !task && i < 2; ++i)
+-        if (music_connected() && (task = waiting_task(agents[i])) != NULL) app = apps[i];
+     char key[sizeof(ui.alert_key)] = "";
+     if (task) snprintf(key, sizeof(key), "%d|%.63s|%.31s", (int)app, task->title, task->project);
+     if (!task || strcmp(key, ui.alert_dismissed) != 0) ui.alert_dismissed[0] = 0;
+@@ -3424,6 +3683,257 @@ static void refresh_alert(void)
+     show_overlay(ui.alert.page);
+ }
+ 
++/* ---- Two-step Amp Need-You badge & card grid ---- */
++
++#define AMP_ALERT_RED 0xFF3B30
++#define AMP_ALERT_BG  0x2B1114
++#define AMP_ALERT_TXT 0xFFE5E4
++
++static void amp_short_age(char *buf, size_t size, uint32_t seconds)
++{
++    if (seconds < 60U) snprintf(buf, size, "%lus", (unsigned long)seconds);
++    else if (seconds < 3600U) snprintf(buf, size, "%lum", (unsigned long)(seconds / 60U));
++    else if (seconds < 86400U) snprintf(buf, size, "%luh", (unsigned long)(seconds / 3600U));
++    else snprintf(buf, size, "%lud", (unsigned long)(seconds / 86400U));
++}
++
++static void close_amp_inbox(void)
++{
++    if (!ui.amp_inbox_open) return;
++    ui.amp_inbox_open = false;
++    if (ui.amp_inbox_page) visible(ui.amp_inbox_page, false);
++    refresh_amp_inbox();
++    refresh_display_power();
++}
++
++static void amp_inbox_close_clicked(lv_event_t *event)
++{
++    (void)event;
++    close_amp_inbox();
++}
++
++static void amp_card_clicked(lv_event_t *event)
++{
++    uint32_t slot = (uint32_t)(uintptr_t)lv_event_get_user_data(event);
++    if (slot >= ui.amp_waiting_count || slot >= BUDDY_CODEX_MAX_TASKS) return;
++    uint32_t item_idx = ui.amp_card_item_idx[slot];
++    close_amp_inbox();
++    if (ui.music_control_callback) {
++        ui.music_control_callback("focus", 100U + item_idx);
++    }
++}
++
++static void create_amp_inbox(void)
++{
++    if (ui.amp_inbox_page) return;
++    ui.amp_inbox_page = box(ui.screen, 0, 0, BOARD_DISPLAY_WIDTH, BOARD_DISPLAY_HEIGHT);
++    lv_obj_add_flag(ui.amp_inbox_page, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_HIDDEN);
++    lv_obj_set_style_bg_color(ui.amp_inbox_page, color(C_BG), 0);
++    lv_obj_set_style_bg_opa(ui.amp_inbox_page, LV_OPA_COVER, 0);
++
++    lv_obj_t *inbox_puck = lv_img_create(ui.amp_inbox_page);
++    lv_img_set_src(inbox_puck, &buddy_logo_codex);
++    lv_img_set_pivot(inbox_puck, 0, 0);
++    lv_img_set_zoom(inbox_puck, 201);
++    lv_obj_set_pos(inbox_puck, 26, 14);
++    lv_obj_clear_flag(inbox_puck, LV_OBJ_FLAG_CLICKABLE);
++
++    ui.amp_inbox_dot = box(ui.amp_inbox_page, 78, 25, 12, 12);
++    lv_obj_set_style_radius(ui.amp_inbox_dot, LV_RADIUS_CIRCLE, 0);
++    lv_obj_set_style_bg_color(ui.amp_inbox_dot, color(AMP_ALERT_RED), 0);
++    lv_obj_set_style_bg_opa(ui.amp_inbox_dot, LV_OPA_COVER, 0);
++
++    ui.amp_inbox_title = text(ui.amp_inbox_page, "Amp", 98, 16, 460, &buddy_language_font_24, C_TEXT);
++    ui.amp_inbox_sub = text(ui.amp_inbox_page, "Tap a thread to open it in Amp on your Mac", 98, 46, 540, &buddy_language_font_14, C_MUTED);
++
++    lv_obj_t *close_btn = box(ui.amp_inbox_page, BOARD_DISPLAY_WIDTH - 120, 16, 92, 42);
++    lv_obj_add_flag(close_btn, LV_OBJ_FLAG_CLICKABLE);
++    lv_obj_set_style_radius(close_btn, 10, 0);
++    lv_obj_set_style_bg_color(close_btn, color(C_PRESSED), 0);
++    lv_obj_set_style_bg_color(close_btn, color(C_RULE), LV_STATE_PRESSED);
++    lv_obj_set_style_bg_opa(close_btn, LV_OPA_COVER, 0);
++    lv_obj_add_event_cb(close_btn, amp_inbox_close_clicked, LV_EVENT_CLICKED, NULL);
++    lv_obj_t *close_lbl = text(close_btn, BT(BT_CLOSE), 0, 0, 92, &buddy_language_font_16, C_TEXT);
++    lv_obj_set_style_text_align(close_lbl, LV_TEXT_ALIGN_CENTER, 0);
++    lv_obj_align(close_lbl, LV_ALIGN_CENTER, 0, 0);
++
++    rule(ui.amp_inbox_page, 28, 72, BOARD_DISPLAY_WIDTH - 56, 1);
++
++    for (unsigned i = 0; i < BUDDY_CODEX_MAX_TASKS; ++i) {
++        lv_obj_t *card = surface_card(ui.amp_inbox_page, 14);
++        lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_HIDDEN);
++        lv_obj_set_style_bg_color(card, color(C_PRESSED), LV_STATE_PRESSED);
++        lv_obj_set_style_border_color(card, color(AMP_ALERT_RED), 0);
++        lv_obj_set_style_border_width(card, 2, 0);
++        lv_obj_set_style_border_opa(card, LV_OPA_COVER, 0);
++        lv_obj_add_event_cb(card, amp_card_clicked, LV_EVENT_CLICKED, (void *)(uintptr_t)i);
++        ui.amp_cards[i] = card;
++
++        lv_obj_t *dot = box(card, 14, 15, 10, 10);
++        lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, 0);
++        lv_obj_set_style_bg_color(dot, color(AMP_ALERT_RED), 0);
++        lv_obj_set_style_bg_opa(dot, LV_OPA_COVER, 0);
++        ui.amp_card_dots[i] = dot;
++
++        ui.amp_card_projects[i] = text(card, "", 30, 11, 140, &buddy_language_font_14, C_MUTED);
++        ui.amp_card_ages[i] = text(card, "", 160, 11, 56, &buddy_language_font_14, C_MUTED);
++        lv_obj_set_style_text_align(ui.amp_card_ages[i], LV_TEXT_ALIGN_RIGHT, 0);
++
++        ui.amp_card_titles[i] = text(card, "", 14, 36, 200, &buddy_language_font_16, C_TEXT);
++        lv_label_set_long_mode(ui.amp_card_titles[i], LV_LABEL_LONG_WRAP);
++        lv_obj_set_style_text_line_space(ui.amp_card_titles[i], 3, 0);
++
++        ui.amp_card_details[i] = text(card, "", 14, 96, 200, &buddy_language_font_14, C_WARNING);
++        lv_label_set_long_mode(ui.amp_card_details[i], LV_LABEL_LONG_WRAP);
++        lv_obj_set_style_text_line_space(ui.amp_card_details[i], 3, 0);
++    }
++}
++
++static void amp_badge_clicked(lv_event_t *event)
++{
++    (void)event;
++    if (ui.amp_waiting_count == 0) return;
++    create_amp_inbox();
++    ui.amp_inbox_open = true;
++    refresh_amp_inbox();
++    show_overlay(ui.amp_inbox_page);
++}
++
++static void create_amp_badge(void)
++{
++    if (ui.amp_badge) return;
++    ui.amp_badge = box(ui.screen, 646, 8, 92, 38);
++    lv_obj_add_flag(ui.amp_badge, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_HIDDEN);
++    lv_obj_set_ext_click_area(ui.amp_badge, 10);
++    lv_obj_set_style_radius(ui.amp_badge, LV_RADIUS_CIRCLE, 0);
++    lv_obj_set_style_bg_color(ui.amp_badge, color(AMP_ALERT_BG), 0);
++    lv_obj_set_style_bg_color(ui.amp_badge, color(0x4A181D), LV_STATE_PRESSED);
++    lv_obj_set_style_bg_opa(ui.amp_badge, LV_OPA_COVER, 0);
++    lv_obj_set_style_border_color(ui.amp_badge, color(AMP_ALERT_RED), 0);
++    lv_obj_set_style_border_width(ui.amp_badge, 2, 0);
++    lv_obj_set_style_border_opa(ui.amp_badge, LV_OPA_COVER, 0);
++    lv_obj_add_event_cb(ui.amp_badge, amp_badge_clicked, LV_EVENT_CLICKED, NULL);
++
++    lv_obj_t *badge_puck = lv_img_create(ui.amp_badge);
++    lv_img_set_src(badge_puck, &buddy_logo_codex);
++    lv_img_set_pivot(badge_puck, 0, 0);
++    lv_img_set_zoom(badge_puck, 119);
++    lv_obj_set_pos(badge_puck, 9, 5);
++    lv_obj_clear_flag(badge_puck, LV_OBJ_FLAG_CLICKABLE);
++
++    ui.amp_badge_dot = box(ui.amp_badge, 41, 13, 10, 10);
++    lv_obj_set_style_radius(ui.amp_badge_dot, LV_RADIUS_CIRCLE, 0);
++    lv_obj_set_style_bg_color(ui.amp_badge_dot, color(AMP_ALERT_RED), 0);
++    lv_obj_set_style_bg_opa(ui.amp_badge_dot, LV_OPA_COVER, 0);
++
++    ui.amp_badge_label = text(ui.amp_badge, "0", 57, 7, 28, &buddy_language_font_20, AMP_ALERT_TXT);
++}
++
++static void place_amp_badge(void)
++{
++    if (!ui.amp_badge) return;
++    if (BOARD_DISPLAY_WIDTH < 800) {
++        lv_obj_set_pos(ui.amp_badge, BOARD_DISPLAY_WIDTH - 98, 6);
++        return;
++    }
++    /* Keep the flashing Puck corner badge clear of Wi-Fi, Monitor clock, and Usage/Tasks tabs. */
++    if (ui.active_app == BUDDY_APP_HOME && !ui.menu_open) {
++        lv_obj_set_pos(ui.amp_badge, 646, 8);
++    } else if (ui.active_app == BUDDY_APP_MONITOR && !ui.menu_open) {
++        lv_obj_set_pos(ui.amp_badge, ui.timer_link_shown ? 314 : 536, 440);
++    } else if ((ui.active_app == BUDDY_APP_CODEX || ui.active_app == BUDDY_APP_CLAUDE) && !ui.menu_open) {
++        lv_obj_set_pos(ui.amp_badge, 430, 24);
++    } else {
++        lv_obj_set_pos(ui.amp_badge, 692, 10);
++    }
++}
++
++static void refresh_amp_inbox(void)
++{
++    uint32_t waiting_count = 0;
++    if (music_connected() && ui.stats.codex.activity.available && !ui.stats.codex.activity.stale) {
++        for (uint32_t i = 0; i < ui.stats.codex.activity.item_count && i < BUDDY_CODEX_MAX_TASKS; ++i) {
++            if (strcmp(ui.stats.codex.activity.items[i].state, "waiting") == 0) {
++                ui.amp_card_item_idx[waiting_count++] = i;
++            }
++        }
++    }
++    ui.amp_waiting_count = waiting_count;
++
++    if (waiting_count == 0 && ui.amp_inbox_open) {
++        ui.amp_inbox_open = false;
++        if (ui.amp_inbox_page) visible(ui.amp_inbox_page, false);
++        refresh_display_power();
++    }
++
++    bool show_badge = waiting_count > 0 && !ui.amp_inbox_open && !ui.startup &&
++        ui.connection != BUDDY_PROVISIONING && !ui.alert_key[0] &&
++        ui.confirm_action == BUDDY_CONFIRM_NONE && ui.install_stage == BUDDY_INSTALL_NONE;
++    if (ui.amp_badge) {
++        visible(ui.amp_badge, show_badge);
++        if (show_badge) {
++            char btxt[12];
++            snprintf(btxt, sizeof(btxt), "%lu", (unsigned long)waiting_count);
++            set_label_if_changed(ui.amp_badge_label, btxt);
++            place_amp_badge();
++            raise_overlays();
++        }
++    }
++
++    if (!ui.amp_inbox_open || !ui.amp_inbox_page) return;
++
++    char heading[64];
++    snprintf(heading, sizeof(heading), "Amp \xC2\xB7 %lu %s",
++             (unsigned long)waiting_count, waiting_count == 1 ? "Needs You" : "Need You");
++    set_label_if_changed(ui.amp_inbox_title, heading);
++
++    /* Responsive grid inside 744x376 body area (x=28, y=84) — zero scrolling for 1..8 threads. */
++    const int area_x = 28, area_y = 84, area_w = BOARD_DISPLAY_WIDTH - 56, area_h = BOARD_DISPLAY_HEIGHT - 102;
++    int cols = waiting_count == 1 ? 1 : waiting_count <= 4 ? 2 : waiting_count <= 6 ? 3 : 4;
++    int rows = (int)((waiting_count + (uint32_t)cols - 1U) / (uint32_t)cols);
++    int gap = cols >= 4 ? 12 : 14;
++    int card_w = waiting_count == 1 ? (area_w * 3 / 4) : (area_w - (cols - 1) * gap) / cols;
++    int card_h = rows == 1 ? (area_h > 250 ? 250 : area_h) : (area_h - (rows - 1) * gap) / rows;
++    int start_x = waiting_count == 1 ? area_x + (area_w - card_w) / 2 : area_x;
++    int start_y = rows == 1 ? area_y + (area_h - card_h) / 2 : area_y;
++    const lv_font_t *title_font = cols <= 2 ? &buddy_language_font_20 : &buddy_language_font_16;
++    int title_h = cols <= 2 ? 56 : 46;
++
++    for (unsigned i = 0; i < BUDDY_CODEX_MAX_TASKS; ++i) {
++        visible(ui.amp_cards[i], i < waiting_count);
++        if (i >= waiting_count) continue;
++        const buddy_codex_task_t *task = &ui.stats.codex.activity.items[ui.amp_card_item_idx[i]];
++        int col = (int)(i % (unsigned)cols);
++        int row = (int)(i / (unsigned)cols);
++        lv_obj_set_pos(ui.amp_cards[i], start_x + col * (card_w + gap), start_y + row * (card_h + gap));
++        lv_obj_set_size(ui.amp_cards[i], card_w, card_h);
++
++        int inner_w = card_w - 28;
++        int age_w = 46;
++        lv_obj_set_pos(ui.amp_card_projects[i], 30, 11);
++        lv_obj_set_width(ui.amp_card_projects[i], inner_w - age_w - 20);
++        lv_obj_set_pos(ui.amp_card_ages[i], card_w - 14 - age_w, 11);
++        lv_obj_set_width(ui.amp_card_ages[i], age_w);
++
++        lv_obj_set_style_text_font(ui.amp_card_titles[i], title_font, 0);
++        lv_obj_set_pos(ui.amp_card_titles[i], 14, 34);
++        lv_obj_set_size(ui.amp_card_titles[i], inner_w, title_h);
++
++        int detail_y = 34 + title_h + 6;
++        int detail_h = card_h - detail_y - 10;
++        if (detail_h < 20) detail_h = 20;
++        lv_obj_set_pos(ui.amp_card_details[i], 14, detail_y);
++        lv_obj_set_size(ui.amp_card_details[i], inner_w, detail_h);
++
++        char age[20];
++        amp_short_age(age, sizeof(age), task->age_s);
++        set_label_if_changed(ui.amp_card_projects[i], task->project[0] ? task->project : "Amp");
++        set_label_if_changed(ui.amp_card_ages[i], age);
++        set_label_if_changed(ui.amp_card_titles[i], task->title[0] ? task->title : "Untitled thread");
++        set_label_if_changed(ui.amp_card_details[i], task->detail[0] ? task->detail : "Waiting for your input");
++    }
++}
++
+ void buddy_ui_set_album_art(uint32_t id, uint16_t size, uint8_t *pixels)
+ {
+     if (!pixels) return;
+@@ -3647,7 +4157,7 @@ buddy_ui_state_t buddy_ui_get_state(void)
+         .timer_completed = ui.timer_completed,
+         .game_active = music_connected() && ui.stats.game.active,
+         .pc_away = ui.pc_away,
+-        .needs_you = ui.alert_key[0] != 0,
++        .needs_you = ui.alert_key[0] != 0 || ui.amp_inbox_open,
+         .install_stage = ui.install_stage,
+         .game_fps = music_connected() && ui.stats.game.active ? ui.stats.game.fps : NAN,
+     };
+diff --git a/firmware/main/ui/buddy_weather_icon.c b/firmware/main/ui/buddy_weather_icon.c
+index b97d924..01c8456 100644
+--- a/firmware/main/ui/buddy_weather_icon.c
++++ b/firmware/main/ui/buddy_weather_icon.c
+@@ -1,6 +1,18 @@
+ #include "buddy_weather_icon.h"
+ #include "buddy_theme.h"
+ 
++#define WX_SUN_CORE   0xFFC845
++#define WX_SUN_RAY    0xFF9F1C
++#define WX_MOON       0xFFD166
++#define WX_STAR       0xFFF3B0
++#define WX_CLOUD_HI   0xE2EAF2
++#define WX_CLOUD_MID  0xB7C5D6
++#define WX_CLOUD_DARK 0x8A9BB0
++#define WX_RAIN       0x4DA6FF
++#define WX_SNOW       0xB8E8FF
++#define WX_BOLT       0xFFD166
++#define WX_FOG        0xB8C6D4
++
+ static void weather_disc(lv_draw_ctx_t *ctx, int x, int y, int radius, uint32_t ink)
+ {
+     lv_draw_rect_dsc_t style;
+@@ -12,59 +24,84 @@ static void weather_disc(lv_draw_ctx_t *ctx, int x, int y, int radius, uint32_t
+     lv_draw_rect(ctx, &style, &area);
+ }
+ 
+-static void weather_stroke(lv_draw_ctx_t *ctx, int x, int y, int scale, int x1, int y1, int x2, int y2)
++static void weather_stroke_color(lv_draw_ctx_t *ctx, int x, int y, int scale,
++                                 int x1, int y1, int x2, int y2, uint32_t ink, int width_mul)
+ {
+     lv_draw_line_dsc_t style;
+     lv_draw_line_dsc_init(&style);
+-    style.color = lv_color_hex(BUDDY_COLOR_WEATHER_MARK);
+-    style.width = 2 * scale;
++    style.color = lv_color_hex(ink);
++    style.width = width_mul * scale;
+     style.round_start = style.round_end = 1;
+     lv_point_t start = {x + x1 * scale, y + y1 * scale}, end = {x + x2 * scale, y + y2 * scale};
+     lv_draw_line(ctx, &style, &start, &end);
+ }
+ 
+-/* Small native vector marks drawn on a 26 x 26 grid times scale; no bitmap buffers. */
++/* Native multi-color vector weather graphics on a 26 x 26 grid times scale; zero bitmap buffers. */
+ void buddy_weather_icon_draw(lv_draw_ctx_t *ctx, int x, int y, int scale, int code, bool is_day, uint32_t background)
+ {
+     if (code <= 1) {
+         if (!is_day) {
+-            weather_disc(ctx, x + 13 * scale, y + 12 * scale, 9 * scale, BUDDY_COLOR_WEATHER_MARK);
+-            weather_disc(ctx, x + 17 * scale, y + 8 * scale, 8 * scale, background);
++            weather_disc(ctx, x + 13 * scale, y + 13 * scale, 9 * scale, WX_MOON);
++            weather_disc(ctx, x + 17 * scale, y + 9 * scale, 8 * scale, background);
++            weather_disc(ctx, x + 21 * scale, y + 5 * scale, scale > 1 ? scale : 1, WX_STAR);
++            weather_disc(ctx, x + 5 * scale, y + 6 * scale, scale > 2 ? scale - 1 : 1, WX_STAR);
+         } else {
+-            weather_disc(ctx, x + 13 * scale, y + 12 * scale, 5 * scale, BUDDY_COLOR_WEATHER_MARK);
+             static const int8_t rays[][4] = {
+-                {13,1,13,3}, {13,21,13,23}, {2,12,4,12}, {22,12,24,12},
+-                {5,4,7,6}, {19,18,21,20}, {5,20,7,18}, {19,6,21,4},
++                {13,1,13,4}, {13,22,13,25}, {1,13,4,13}, {22,13,25,13},
++                {4,4,7,7}, {19,19,22,22}, {4,22,7,19}, {19,7,22,4},
+             };
+             for (unsigned i = 0; i < sizeof(rays) / sizeof(rays[0]); ++i)
+-                weather_stroke(ctx, x, y, scale, rays[i][0], rays[i][1], rays[i][2], rays[i][3]);
++                weather_stroke_color(ctx, x, y, scale, rays[i][0], rays[i][1], rays[i][2], rays[i][3], WX_SUN_RAY, 2);
++            weather_disc(ctx, x + 13 * scale, y + 13 * scale, 6 * scale, WX_SUN_CORE);
+         }
+         return;
+     }
+     if (code == 45 || code == 48) {
+-        weather_stroke(ctx, x, y, scale, 3, 7, 23, 7);
+-        weather_stroke(ctx, x, y, scale, 6, 13, 25, 13);
+-        weather_stroke(ctx, x, y, scale, 2, 19, 21, 19);
++        weather_stroke_color(ctx, x, y, scale, 3, 7, 23, 7, WX_FOG, 2);
++        weather_stroke_color(ctx, x, y, scale, 5, 13, 24, 13, WX_CLOUD_MID, 2);
++        weather_stroke_color(ctx, x, y, scale, 2, 19, 21, 19, WX_FOG, 2);
+         return;
+     }
++
++    /* Partly cloudy: golden sun (or moon at night) peeking behind the cloud. */
++    if (code == 2) {
++        if (is_day) {
++            weather_disc(ctx, x + 18 * scale, y + 8 * scale, 5 * scale, WX_SUN_CORE);
++            weather_stroke_color(ctx, x, y, scale, 18, 1, 18, 2, WX_SUN_RAY, 2);
++            weather_stroke_color(ctx, x, y, scale, 24, 8, 25, 8, WX_SUN_RAY, 2);
++            weather_stroke_color(ctx, x, y, scale, 23, 3, 24, 2, WX_SUN_RAY, 2);
++        } else {
++            weather_disc(ctx, x + 18 * scale, y + 8 * scale, 5 * scale, WX_MOON);
++            weather_disc(ctx, x + 21 * scale, y + 6 * scale, 4 * scale, background);
++        }
++    }
++
+     bool precipitation = code >= 51;
++    bool storm = code >= 95;
++    bool snow = (code >= 71 && code <= 77) || code == 85 || code == 86;
++    uint32_t cloud_col = storm ? WX_CLOUD_DARK : precipitation ? WX_CLOUD_MID : (code == 3 ? WX_CLOUD_MID : WX_CLOUD_HI);
+     int cloud_y = precipitation ? 10 : 14;
+-    weather_disc(ctx, x + 7 * scale, y + cloud_y * scale, 5 * scale, BUDDY_COLOR_WEATHER_MARK);
+-    weather_disc(ctx, x + 14 * scale, y + (cloud_y - 3) * scale, 7 * scale, BUDDY_COLOR_WEATHER_MARK);
+-    weather_disc(ctx, x + 21 * scale, y + cloud_y * scale, 5 * scale, BUDDY_COLOR_WEATHER_MARK);
+-    weather_stroke(ctx, x, y, scale, 7, cloud_y + 4, 21, cloud_y + 4);
+-    if (code >= 95) {
+-        weather_stroke(ctx, x, y, scale, 15, 16, 11, 21);
+-        weather_stroke(ctx, x, y, scale, 11, 21, 16, 21);
+-        weather_stroke(ctx, x, y, scale, 16, 21, 13, 25);
+-    } else if ((code >= 71 && code <= 77) || code == 85 || code == 86) {
+-        for (int offset = 7; offset <= 21; offset += 14) {
+-            weather_stroke(ctx, x, y, scale, offset - 2, 21, offset + 2, 21);
+-            weather_stroke(ctx, x, y, scale, offset, 19, offset, 23);
++
++    weather_disc(ctx, x + 7 * scale, y + cloud_y * scale, 5 * scale, cloud_col);
++    weather_disc(ctx, x + 14 * scale, y + (cloud_y - 3) * scale, 7 * scale, cloud_col);
++    weather_disc(ctx, x + 20 * scale, y + cloud_y * scale, 5 * scale, cloud_col);
++    weather_stroke_color(ctx, x, y, scale, 7, cloud_y + 4, 20, cloud_y + 4, cloud_col, 2);
++
++    if (storm) {
++        weather_stroke_color(ctx, x, y, scale, 15, 14, 11, 19, WX_BOLT, 2);
++        weather_stroke_color(ctx, x, y, scale, 11, 19, 16, 19, WX_BOLT, 2);
++        weather_stroke_color(ctx, x, y, scale, 16, 19, 12, 25, WX_BOLT, 2);
++        weather_stroke_color(ctx, x, y, scale, 7, 18, 5, 22, WX_RAIN, 2);
++        weather_stroke_color(ctx, x, y, scale, 21, 18, 19, 22, WX_RAIN, 2);
++    } else if (snow) {
++        for (int offset = 7; offset <= 21; offset += 7) {
++            int sy = offset == 14 ? 22 : 19;
++            weather_stroke_color(ctx, x, y, scale, offset - 2, sy, offset + 2, sy, WX_SNOW, 2);
++            weather_stroke_color(ctx, x, y, scale, offset, sy - 2, offset, sy + 2, WX_SNOW, 2);
+         }
+     } else if (precipitation) {
+-        weather_stroke(ctx, x, y, scale, 8, 19, 6, 23);
+-        weather_stroke(ctx, x, y, scale, 15, 19, 13, 23);
+-        weather_stroke(ctx, x, y, scale, 22, 19, 20, 23);
++        weather_stroke_color(ctx, x, y, scale, 8, 18, 6, 23, WX_RAIN, 2);
++        weather_stroke_color(ctx, x, y, scale, 14, 18, 12, 24, WX_RAIN, 2);
++        weather_stroke_color(ctx, x, y, scale, 20, 18, 18, 23, WX_RAIN, 2);
+     }
+ }

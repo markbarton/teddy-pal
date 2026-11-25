@@ -1,0 +1,32 @@
+# macOS / Editor
+.DS_Store
+.AppleDouble
+.LSOverride
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Swift / macOS build artifacts
+ClawPalMac/.build/
+ClawPalMac/.swiftpm/
+ClawPalMac/build/
+ClawPalMac/Resources/AmpPuck.png
+
+# Local upstream firmware clone & builds (users clone Kaayoos/clawpal separately)
+firmware-fork/
+
+# Internal/local notes and secrets (never commit keys or tokens)
+HANDOFF.md
+*.pem
+*.p12
+*.cer
+*.key
+.env
+.env.*
