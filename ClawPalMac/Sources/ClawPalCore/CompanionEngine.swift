@@ -83,6 +83,10 @@ public final class CompanionEngine: ObservableObject {
     private var claudeLiveTask: Task<Void, Never>?
     private var appNapActivity: NSObjectProtocol?
     private var seq: Int = 0
+    private var lastArtSentId: Int = 0
+    private var artSupported: Bool = true
+    private var artRetryAt: Date = .distantPast
+    private var artConsecutiveFailures: Int = 0
 
     private let wsSession: URLSession = {
         let cfg = URLSessionConfiguration.ephemeral
@@ -513,13 +517,12 @@ public final class CompanionEngine: ObservableObject {
         }
         defer { receiver.cancel() }
 
-        var artSentId = 0
-        var artSupported = true
-        var artRetryAt = Date.distantPast
+        let sessionConnectedAt = Date()
         var artTask: Task<Int, Never>?
         defer { artTask?.cancel() }
 
         let encoder = JSONEncoder()
+        var loggedFrameSize = false
 
         while !Task.isCancelled {
             if state.receiverFailed {
@@ -575,16 +578,22 @@ public final class CompanionEngine: ObservableObject {
             }
 
             try await ws.send(.string(payloadStr))
+            if !loggedFrameSize {
+                loggedFrameSize = true
+                appendLog("Telemetry frame size: \(payloadData.count)B")
+            }
 
-            // Non-blocking background album cover upload
+            // Non-blocking background album cover upload (delayed 4s after connect;
+            // state persists across reconnects so a slow 2.4 GHz link never loops on /art).
             if let existing = artTask, existing.isCancelled {
                 artTask = nil
             }
             if let cov = mediaController.cover,
                artTask == nil, artSupported,
-               musicSnap.artId == cov.id, cov.id != artSentId,
+               Date().timeIntervalSince(sessionConnectedAt) >= 4.0,
+               musicSnap.artId == cov.id, cov.id != lastArtSentId,
                Date() >= artRetryAt {
-                artSentId = cov.id
+                lastArtSentId = cov.id
                 let host = endpoint.host
                 artTask = Task.detached { [weak self] in
                     let code = await Self.uploadCover(deviceId: dev, host: host, token: tok, cover: cov)
@@ -599,8 +608,22 @@ public final class CompanionEngine: ObservableObject {
                 // Poll completion without blocking 1 Hz cadence
                 if let result = await pollTaskIfDone(currentTask) {
                     artTask = nil
-                    if result == 404 || result == 405 { artSupported = false }
-                    else if result != 200 { artSentId = 0; artRetryAt = Date().addingTimeInterval(30) }
+                    if result == 404 || result == 405 {
+                        artSupported = false
+                    } else if result == 200 {
+                        artConsecutiveFailures = 0
+                    } else {
+                        artConsecutiveFailures += 1
+                        if artConsecutiveFailures < 2 {
+                            lastArtSentId = 0
+                            artRetryAt = Date().addingTimeInterval(90)
+                        } else {
+                            // Keep lastArtSentId so we don't keep stalling a noisy Wi-Fi link for the same track;
+                            // next track change gets a fresh artId and tries again.
+                            appendLog("Album cover paused for current track (Wi-Fi timeout)")
+                            artConsecutiveFailures = 0
+                        }
+                    }
                 }
             }
 
