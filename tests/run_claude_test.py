@@ -45,7 +45,7 @@ def test_contract() -> None:
     row = cc.observe({
         "session_id": "fixture-1",
         "session_name": "Release check",
-        "cwd": "/Users/mark/Projects/Example",
+        "cwd": "/Users/dev/Projects/Example",
         "model": {"display_name": "Sonnet"},
         "rate_limits": {
             "five_hour": {"used_percentage": 27, "resets_at": 1800001800},
@@ -137,7 +137,7 @@ def test_bridge_install_uninstall_and_forwarding() -> None:
         cdir.mkdir()
         settings_path = cdir / "settings.json"
 
-        # Realistic settings resembling Mark's existing hooks (say, curl, Orca) + statusLine
+        # Realistic settings with third-party hooks + statusLine
         original = json.dumps({
             "permissions": {"allow": ["Read"]},
             "statusLine": {
@@ -180,7 +180,7 @@ def test_bridge_install_uninstall_and_forwarding() -> None:
         payload = json.dumps({
             "session_id": "live-test-1",
             "session_name": "Statusline test",
-            "cwd": "/Users/mark/projects/clawpal-mac",
+            "cwd": "/Users/dev/projects/clawpal-mac",
             "model": {"display_name": "Opus"},
             "rate_limits": {
                 "five_hour": {"used_percentage": 15.5, "resets_at": int(time.time()) + 3600},
@@ -236,7 +236,7 @@ def test_end_to_end_session_with_claude() -> None:
         cc.store_event({
             "session_id": "e2e-1",
             "session_name": "E2E Claude",
-            "cwd": "/Users/mark/projects/clawpal-mac",
+            "cwd": "/Users/dev/projects/clawpal-mac",
             "hook_event_name": "PermissionRequest",
         }, status_line=False, state_directory=bdir)
 

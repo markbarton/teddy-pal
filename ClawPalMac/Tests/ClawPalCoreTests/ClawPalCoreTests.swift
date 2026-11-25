@@ -144,7 +144,7 @@ struct ClawPalChecks {
         )
 
         let transcriptJsonl = Data("""
-        {"type":"user","cwd":"/Users/alex/projects/sample-api","message":{"role":"user","content":"<pasted_content id=\\"87a7\\"> command to update auth-cli global package"}}
+        {"type":"user","cwd":"/Users/dev/projects/sample-api","message":{"role":"user","content":"<pasted_content id=\\"87a7\\"> command to update auth-cli global package"}}
         {"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Sure"}]}}
         """.utf8)
         let meta = ClaudeProvider.parseTranscriptMetadata(from: transcriptJsonl)
@@ -153,7 +153,7 @@ struct ClawPalChecks {
             "ClaudeProvider extracts clean prompt title & project from JSONL transcript"
         )
         let customTitleJsonl = Data("""
-        {"type":"user","cwd":"/Users/alex/projects/seo-tools","message":{"role":"user","content":"raw prompt"}}
+        {"type":"user","cwd":"/Users/dev/projects/seo-tools","message":{"role":"user","content":"raw prompt"}}
         {"type":"custom-title","customTitle":"Sample SEO analysis tool"}
         """.utf8)
         let customMeta = ClaudeProvider.parseTranscriptMetadata(from: customTitleJsonl)
