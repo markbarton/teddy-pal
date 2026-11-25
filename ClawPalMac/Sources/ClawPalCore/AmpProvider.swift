@@ -603,9 +603,13 @@ public final class AmpProvider {
     public static func selectDisplayThreads(from threads: [AmpThreadDetail], now: TimeInterval) -> [AmpThreadDetail] {
         let working = threads.filter(\.isWorking).sorted { $0.updatedAt > $1.updatedAt }
         let waiting = threads.filter { !$0.isWorking && $0.waitingOnInput }.sorted { $0.attentionTimestamp > $1.attentionTimestamp }
+        let urgent = Array((working + waiting).prefix(8))
+        if urgent.count >= 3 {
+            return urgent
+        }
         let recent = threads.filter { !$0.isWorking && !$0.waitingOnInput && (now - $0.updatedAt <= recentWindowSeconds) }
             .sorted { $0.updatedAt > $1.updatedAt }
-        return Array((working + waiting + recent).prefix(8))
+        return Array((urgent + recent).prefix(3))
     }
 
     public static func buildProviderStats(
@@ -633,7 +637,7 @@ public final class AmpProvider {
             let refTime = t.waitingOnInput ? t.attentionTimestamp : t.updatedAt
             let age = Int(min(max(now - refTime, 0), 31_535_999))
             let projectText = t.project.isEmpty ? "Amp" : t.project
-            let detailText = t.statusMessage.isEmpty ? nil : clawpalLimitText(t.statusMessage, maxUtf8Bytes: 79)
+            let detailText = (t.waitingOnInput && !t.statusMessage.isEmpty) ? clawpalLimitText(t.statusMessage, maxUtf8Bytes: 79) : nil
             return ProviderTaskItem(
                 title: clawpalLimitText(t.title, maxUtf8Bytes: 63),
                 project: clawpalLimitText(projectText, maxUtf8Bytes: 31),

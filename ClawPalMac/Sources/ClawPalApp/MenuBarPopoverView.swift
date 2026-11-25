@@ -16,7 +16,7 @@ struct MenuBarPopoverView: View {
                 VStack(alignment: .leading, spacing: 1) {
                     Text("ClawPal")
                         .font(.headline)
-                    Text(engine.status.label)
+                    Text(engine.connectedDurationText.isEmpty ? engine.status.label : "\(engine.status.label) · \(engine.connectedDurationText)")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)

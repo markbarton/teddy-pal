@@ -31,6 +31,8 @@ public enum ConnectionStatus: Equatable {
 @MainActor
 public final class CompanionEngine: ObservableObject {
     @Published public var status: ConnectionStatus = .stopped
+    @Published public var connectedSince: Date? = nil
+    @Published public var connectedDurationText: String = ""
     @Published public var isPaused: Bool = false
     @Published public var deviceId: String = ""
     @Published public var connectedHost: String?
@@ -250,6 +252,8 @@ public final class CompanionEngine: ObservableObject {
             appNapActivity = nil
         }
         status = .stopped
+        connectedSince = nil
+        connectedDurationText = ""
         appendLog("Companion paused")
     }
 
@@ -461,6 +465,8 @@ public final class CompanionEngine: ObservableObject {
                 }
                 appendLog("Connection: \(error.localizedDescription) (retry in \(retrySeconds)s)")
                 status = .searching
+                connectedSince = nil
+                connectedDurationText = ""
             }
             try? await Task.sleep(for: .seconds(retrySeconds))
             retrySeconds = min(retrySeconds + 1, 3)
@@ -495,6 +501,9 @@ public final class CompanionEngine: ObservableObject {
             try? cfg.save()
         }
         status = .connected(endpoint.host)
+        let nowConnected = Date()
+        connectedSince = nowConnected
+        connectedDurationText = "0s"
         appendLog("Connected to ClawPal at \(endpoint.host)")
 
         // Fetch initial /health and /settings once (sequentially, after WS settles) —
@@ -547,6 +556,9 @@ public final class CompanionEngine: ObservableObject {
 
             cpuUsage = sys.cpu.usage ?? 0
             memoryUsage = sys.memory.usage
+            if let since = connectedSince {
+                connectedDurationText = Self.formatUptime(Date().timeIntervalSince(since))
+            }
             memoryText = String(format: "%.1f / %.0f GB", Double(sys.memory.usedMb) / 1024.0, Double(sys.memory.totalMb) / 1024.0)
             music = musicSnap
             coverImageData = mediaController.cover?.previewImageData
@@ -750,6 +762,14 @@ public final class CompanionEngine: ObservableObject {
         } catch {
             return 0
         }
+    }
+
+    public static func formatUptime(_ seconds: TimeInterval) -> String {
+        let secs = max(0, Int(seconds))
+        if secs < 60 { return "\(secs)s" }
+        if secs < 3600 { return "\(secs / 60)m" }
+        if secs < 86_400 { return "\(secs / 3600)h \((secs % 3600) / 60)m" }
+        return "\(secs / 86_400)d \((secs % 86_400) / 3600)h"
     }
 
     private static let timeFmt: DateFormatter = {

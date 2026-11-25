@@ -1,3 +1,16 @@
+diff --git a/firmware/boards/waveshare-esp32-s3-touch-lcd-4.3b.defaults b/firmware/boards/waveshare-esp32-s3-touch-lcd-4.3b.defaults
+index cd8de47..8a80e84 100644
+--- a/firmware/boards/waveshare-esp32-s3-touch-lcd-4.3b.defaults
++++ b/firmware/boards/waveshare-esp32-s3-touch-lcd-4.3b.defaults
+@@ -20,6 +20,8 @@ CONFIG_HTTPD_WS_PRE_HANDSHAKE_CB_SUPPORT=y
+ CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
+ CONFIG_HTTPD_MAX_URI_LEN=256
+ CONFIG_LWIP_MAX_SOCKETS=16
++# Smaller TCP MSS keeps segments under ~800B for reliable 2.4 GHz Wi-Fi on compact PCB antennas.
++CONFIG_LWIP_TCP_MSS=768
+ CONFIG_LV_COLOR_DEPTH_16=y
+ CONFIG_LV_MEM_CUSTOM=y
+ CONFIG_LV_MEMCPY_MEMSET_STD=y
 diff --git a/firmware/main/CMakeLists.txt b/firmware/main/CMakeLists.txt
 index a841710..88c251a 100644
 --- a/firmware/main/CMakeLists.txt
@@ -128,7 +141,7 @@ index 2dc2d0b..6787e4f 100644
              if (now_us - last_clock_us >= 1000000) {
                  update_clock();
 diff --git a/firmware/main/network/buddy_network.c b/firmware/main/network/buddy_network.c
-index b9c0315..3e4c44d 100644
+index b9c0315..c99d58f 100644
 --- a/firmware/main/network/buddy_network.c
 +++ b/firmware/main/network/buddy_network.c
 @@ -10,6 +10,7 @@
@@ -354,7 +367,7 @@ index b9c0315..3e4c44d 100644
  static esp_err_t start_monitor_server(void)
  {
      httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-@@ -994,7 +1098,7 @@ static esp_err_t start_monitor_server(void)
+@@ -994,11 +1098,11 @@ static esp_err_t start_monitor_server(void)
      config.ctrl_port = MONITOR_PORT + 1;
      config.stack_size = 8192;
      config.max_open_sockets = 4;
@@ -362,7 +375,13 @@ index b9c0315..3e4c44d 100644
 +    config.max_uri_handlers = 15;
      config.lru_purge_enable = true;
      config.close_fn = close_session;
-     config.recv_wait_timeout = 3;
+-    config.recv_wait_timeout = 3;
+-    config.send_wait_timeout = 3;
++    config.recv_wait_timeout = 8;
++    config.send_wait_timeout = 8;
+     ESP_RETURN_ON_ERROR(httpd_start(&monitor_server, &config), TAG, "Monitor HTTP server");
+     const httpd_uri_t firmware_read={.uri="/firmware",.method=HTTP_GET,.handler=firmware_get_handler};
+     const httpd_uri_t firmware_write={.uri="/firmware",.method=HTTP_POST,.handler=firmware_post_handler};
 @@ -1027,8 +1131,10 @@ static esp_err_t start_monitor_server(void)
      ESP_RETURN_ON_ERROR(httpd_register_uri_handler(monitor_server, &art), TAG, "Cover URI");
      const httpd_uri_t shortcuts = {.uri = "/shortcuts", .method = HTTP_POST, .handler = shortcuts_handler};
@@ -374,6 +393,14 @@ index b9c0315..3e4c44d 100644
      return httpd_register_uri_handler(monitor_server, &snapshot);
  }
  
+@@ -1381,6 +1487,7 @@ esp_err_t buddy_network_start(const buddy_network_callbacks_t *requested_callbac
+     ESP_RETURN_ON_ERROR(start_monitor_server(), TAG, "Monitor service");
+     ESP_RETURN_ON_ERROR(esp_wifi_start(), TAG, "Wi-Fi start");
+     ESP_RETURN_ON_ERROR(esp_wifi_set_ps(WIFI_PS_NONE), TAG, "Wi-Fi performance mode");
++    (void)esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT20);
+     if (xTaskCreate(discovery_task, "buddy_discovery", 4096, NULL, 3, NULL) != pdPASS ||
+         xTaskCreate(connection_task, "buddy_connection", 5120, NULL, 3, NULL) != pdPASS ||
+         xTaskCreate(music_control_task, "buddy_music_tx", 3072, NULL, 3, NULL) != pdPASS) {
 diff --git a/firmware/main/network/buddy_network.h b/firmware/main/network/buddy_network.h
 index 69a6b08..383d46b 100644
 --- a/firmware/main/network/buddy_network.h
@@ -399,10 +426,18 @@ index 53f597c..19aff7c 100644
            copy_json_string(value, "state", task->state, sizeof(task->state)) &&
            cJSON_IsNumber(cJSON_GetObjectItemCaseSensitive(value, "age_s")) &&
 diff --git a/firmware/main/ui/buddy_ui.c b/firmware/main/ui/buddy_ui.c
-index 1b80042..a28dcfe 100644
+index 1b80042..a6cd281 100644
 --- a/firmware/main/ui/buddy_ui.c
 +++ b/firmware/main/ui/buddy_ui.c
-@@ -25,6 +25,7 @@
+@@ -15,6 +15,7 @@
+ #include "esp_log.h"
+ #include "esp_app_desc.h"
+ #include "esp_heap_caps.h"
++#include "esp_timer.h"
+ #include "buddy_mascot.h"
+ #include "buddy_clock_font.h"
+ #include "buddy_music_font.h"
+@@ -25,6 +26,7 @@
  #include "buddy_weather_page.h"
  #include "buddy_shortcuts_page.h"
  #include "buddy_weather_icon.h"
@@ -410,7 +445,7 @@ index 1b80042..a28dcfe 100644
  
  /* Broadcast meter bridge: real channels, shared time, restrained state ink. */
  #define C_BG       BUDDY_COLOR_BG
-@@ -103,6 +104,8 @@ static struct {
+@@ -103,6 +105,8 @@ static struct {
      lv_obj_t *home_page, *game_panel, *game_title, *game_fps, *game_status;
      lv_obj_t *clock_large, *clock_date, *clock_mascot;
      lv_obj_t *weather_row, *weather_icon, *weather_text, *weather_note;
@@ -419,7 +454,7 @@ index 1b80042..a28dcfe 100644
      buddy_weather_t weather;
      lv_obj_t *music_page, *music_logo, *music_heading, *music_status, *music_eq, *music_eq_bars[3];
      lv_obj_t *music_cover, *music_rings[2], *music_buddy, *music_meta, *music_title, *music_artist, *music_album;
-@@ -156,10 +159,22 @@ static struct {
+@@ -156,10 +160,22 @@ static struct {
      buddy_confirm_action_t confirm_action;
      uint32_t confirm_started;
      char confirm_detail[BUDDY_CONFIRM_DETAIL_SIZE], install_detail[BUDDY_CONFIRM_DETAIL_SIZE];
@@ -443,7 +478,15 @@ index 1b80042..a28dcfe 100644
      /* A Wi-Fi firmware install in progress. */
      lv_obj_t *install_page, *install_title, *install_version, *install_track, *install_fill, *install_mascot;
      lv_obj_t *install_percent, *install_stage_label, *install_note;
-@@ -223,6 +238,9 @@ static bool claude_tasks_stale(void);
+@@ -188,6 +204,7 @@ static struct {
+     char ssid[96], ip[48], message[192];
+     bool have_stats, details_visible, gpu_selected, fresh_sample;
+     uint32_t last_stats_tick;
++    int64_t pc_connected_since_us;
+     lv_timer_t *history_timer, *mascot_timer;
+ } ui;
+ 
+@@ -223,6 +240,9 @@ static bool claude_tasks_stale(void);
  static void refresh_home(void);
  static void refresh_game(void);
  static void refresh_alert(void);
@@ -453,7 +496,7 @@ index 1b80042..a28dcfe 100644
  
  /* A PC that is connected and not locked or asleep. */
  static bool pc_live(void)
-@@ -237,6 +255,7 @@ static void dismiss_startup(void)
+@@ -237,6 +257,7 @@ static void dismiss_startup(void)
      ui.startup = NULL;
      ui.startup_mascot = NULL;
      lv_img_cache_invalidate_src(&ui.startup_frame);
@@ -461,7 +504,7 @@ index 1b80042..a28dcfe 100644
  }
  
  static buddy_settings_t view_settings = {.enabled_apps = 511, .weather_enabled = true, .dim_behavior = 1, .dim_after_seconds = 60, .dim_brightness = 40, .night_enabled = true, .night_start = 1, .night_end = 10, .offline_app = 1};
-@@ -362,7 +381,7 @@ static void refresh_display_power(void)
+@@ -362,7 +383,7 @@ static void refresh_display_power(void)
      ui.power_tick = now;
      bool connected = pc_live();
      if ((connected && view_settings.dim_behavior != 2) || touched != ui.last_touch_tick || ui.wake_touch_active ||
@@ -470,7 +513,7 @@ index 1b80042..a28dcfe 100644
          ui.idle_ms = 0;
      } else {
          /* Saturation prevents a long unattended run from waking at tick wrap. */
-@@ -664,6 +683,9 @@ static buddy_mascot_state_t mascot_state(void)
+@@ -664,6 +685,9 @@ static buddy_mascot_state_t mascot_state(void)
          return music_connected() && ui.stats.claude.running ? BUDDY_MASCOT_TYPING : BUDDY_MASCOT_IDLE;
      }
      if (ui.active_app == BUDDY_APP_CLOCK) {
@@ -480,43 +523,47 @@ index 1b80042..a28dcfe 100644
          const bool pc_available = ui.connection == BUDDY_PC_CONNECTED && ui.have_stats &&
                                    lv_tick_elaps(ui.last_stats_tick) < CLOCK_DELAY_MS;
          return pc_available ? BUDDY_MASCOT_IDLE : BUDDY_MASCOT_SLEEPING;
-@@ -768,6 +790,35 @@ static void mascot_tick(lv_timer_t *timer)
+@@ -768,6 +792,39 @@ static void mascot_tick(lv_timer_t *timer)
      }
      if (ui.alert_key[0] && ui.alert.tile)
          lv_obj_set_style_border_opa(ui.alert.tile, (lv_tick_get() / 600U) % 2U ? LV_OPA_COVER : LV_OPA_20, 0);
-+    /* Smooth flashing red corner badge when Amp has threads waiting for you. */
-+    if (ui.amp_badge && !lv_obj_has_flag(ui.amp_badge, LV_OBJ_FLAG_HIDDEN)) {
-+        uint32_t t = lv_tick_get() % 1100U;
-+        uint32_t tri = t < 550U ? t : (1100U - t);
-+        lv_opa_t dot_opa = (lv_opa_t)(LV_OPA_30 + (tri * (LV_OPA_COVER - LV_OPA_30)) / 550U);
-+        lv_opa_t border_opa = (lv_opa_t)(LV_OPA_40 + (tri * (LV_OPA_COVER - LV_OPA_40)) / 550U);
-+        lv_obj_set_style_bg_opa(ui.amp_badge_dot, dot_opa, 0);
-+        lv_obj_set_style_border_opa(ui.amp_badge, border_opa, 0);
-+    }
-+    /* Each Amp waiting card in the grid flashes independently on its own period & phase. */
-+    if (ui.amp_inbox_open && ui.amp_inbox_page) {
-+        static const uint32_t periods[BUDDY_CODEX_MAX_TASKS] = { 620, 790, 930, 680, 850, 740, 990, 710 };
-+        static const uint32_t phases[BUDDY_CODEX_MAX_TASKS]  = { 0, 210, 470, 120, 360, 580, 190, 430 };
-+        uint32_t now = lv_tick_get();
-+        if (ui.amp_inbox_dot) {
-+            uint32_t ht = now % 1000U;
-+            uint32_t htri = ht < 500U ? ht : (1000U - ht);
-+            lv_obj_set_style_bg_opa(ui.amp_inbox_dot, (lv_opa_t)(LV_OPA_30 + (htri * (LV_OPA_COVER - LV_OPA_30)) / 500U), 0);
++    /* Smooth flashing red corner badge & Amp inbox cards (throttled to ~4 Hz to keep PSRAM/Wi-Fi fast). */
++    static uint32_t last_amp_pulse_ms = 0;
++    uint32_t amp_now = lv_tick_get();
++    if (amp_now - last_amp_pulse_ms >= 250U) {
++        last_amp_pulse_ms = amp_now;
++        if (ui.amp_badge && !lv_obj_has_flag(ui.amp_badge, LV_OBJ_FLAG_HIDDEN)) {
++            uint32_t t = amp_now % 1100U;
++            uint32_t tri = t < 550U ? t : (1100U - t);
++            lv_opa_t dot_opa = (lv_opa_t)(LV_OPA_30 + (tri * (LV_OPA_COVER - LV_OPA_30)) / 550U);
++            lv_opa_t border_opa = (lv_opa_t)(LV_OPA_40 + (tri * (LV_OPA_COVER - LV_OPA_40)) / 550U);
++            lv_obj_set_style_bg_opa(ui.amp_badge_dot, dot_opa, 0);
++            lv_obj_set_style_border_opa(ui.amp_badge, border_opa, 0);
 +        }
-+        for (unsigned i = 0; i < ui.amp_waiting_count && i < BUDDY_CODEX_MAX_TASKS; ++i) {
-+            uint32_t p = periods[i];
-+            uint32_t t = (now + phases[i]) % (p * 2U);
-+            uint32_t tri = t < p ? t : (p * 2U - t);
-+            lv_opa_t dot_opa = (lv_opa_t)(LV_OPA_20 + (tri * (LV_OPA_COVER - LV_OPA_20)) / p);
-+            lv_opa_t border_opa = (lv_opa_t)(LV_OPA_20 + (tri * (LV_OPA_COVER - LV_OPA_20)) / p);
-+            lv_obj_set_style_bg_opa(ui.amp_card_dots[i], dot_opa, 0);
-+            lv_obj_set_style_border_opa(ui.amp_cards[i], border_opa, 0);
++        /* Each Amp waiting card in the grid flashes independently on its own period & phase. */
++        if (ui.amp_inbox_open && ui.amp_inbox_page) {
++            static const uint32_t periods[BUDDY_CODEX_MAX_TASKS] = { 620, 790, 930, 680, 850, 740, 990, 710 };
++            static const uint32_t phases[BUDDY_CODEX_MAX_TASKS]  = { 0, 210, 470, 120, 360, 580, 190, 430 };
++            if (ui.amp_inbox_dot) {
++                uint32_t ht = amp_now % 1000U;
++                uint32_t htri = ht < 500U ? ht : (1000U - ht);
++                lv_obj_set_style_bg_opa(ui.amp_inbox_dot, (lv_opa_t)(LV_OPA_30 + (htri * (LV_OPA_COVER - LV_OPA_30)) / 500U), 0);
++            }
++            for (unsigned i = 0; i < ui.amp_waiting_count && i < BUDDY_CODEX_MAX_TASKS; ++i) {
++                uint32_t p = periods[i];
++                uint32_t t = (amp_now + phases[i]) % (p * 2U);
++                uint32_t tri = t < p ? t : (p * 2U - t);
++                lv_opa_t dot_opa = (lv_opa_t)(LV_OPA_20 + (tri * (LV_OPA_COVER - LV_OPA_20)) / p);
++                lv_opa_t border_opa = (lv_opa_t)(LV_OPA_20 + (tri * (LV_OPA_COVER - LV_OPA_20)) / p);
++                lv_obj_set_style_bg_opa(ui.amp_card_dots[i], dot_opa, 0);
++                lv_obj_set_style_border_opa(ui.amp_cards[i], border_opa, 0);
++            }
 +        }
 +    }
      if (buddy_theme_has_mascot()) feed_mascot();
  }
  
-@@ -871,9 +922,12 @@ static void refresh_visibility(void)
+@@ -871,9 +928,12 @@ static void refresh_visibility(void)
      lv_obj_set_style_opa(ui.apps_button, need_setup ? LV_OPA_50 : LV_OPA_COVER, 0);
      if (!ui.menu_open) for (unsigned i = 0; i < BUDDY_APP_COUNT; ++i) buddy_ui_motion_cancel(ui.app_rows[i]);
      chooser_layout();
@@ -530,7 +577,37 @@ index 1b80042..a28dcfe 100644
      refresh_display_power();
  }
  
-@@ -1033,7 +1087,7 @@ static void begin_app_transition(void)
+@@ -939,8 +999,27 @@ static void refresh_footer(void)
+     if (ui.menu_open) {
+         lv_label_set_text(ui.footer, BT(BT_CHOOSE_AN_APP));
+     } else if (ui.active_app == BUDDY_APP_HOME) {
+-        snprintf(buf, sizeof(buf), BT(BT_CLAWPAL_VERSION), esp_app_get_description()->version);
+-        lv_label_set_text(ui.footer, buf);
++        char ver[48], up[32];
++        snprintf(ver, sizeof(ver), BT(BT_CLAWPAL_VERSION), esp_app_get_description()->version);
++        if (ui.connection == BUDDY_PC_CONNECTED && ui.pc_connected_since_us > 0) {
++            int64_t delta_us = esp_timer_get_time() - ui.pc_connected_since_us;
++            uint64_t secs = delta_us > 0 ? (uint64_t)(delta_us / 1000000LL) : 0;
++            if (secs < 60ULL) {
++                snprintf(up, sizeof(up), "%lus", (unsigned long)secs);
++            } else if (secs < 3600ULL) {
++                snprintf(up, sizeof(up), "%lum", (unsigned long)(secs / 60ULL));
++            } else if (secs < 86400ULL) {
++                snprintf(up, sizeof(up), "%luh %lum", (unsigned long)(secs / 3600ULL),
++                         (unsigned long)((secs % 3600ULL) / 60ULL));
++            } else {
++                snprintf(up, sizeof(up), "%lud %luh", (unsigned long)(secs / 86400ULL),
++                         (unsigned long)((secs % 86400ULL) / 3600ULL));
++            }
++            snprintf(buf, sizeof(buf), "%s \xC2\xB7 %s", ver, up);
++        } else {
++            snprintf(buf, sizeof(buf), "%s \xC2\xB7 offline", ver);
++        }
++        set_label_if_changed(ui.footer, buf);
+     } else if (shortcut) {
+         lv_label_set_text(ui.footer, ui.active_app == BUDDY_APP_MUSIC ? BT(BT_SPOTIFY_ON_YOUR_PC) :
+             ui.active_app == BUDDY_APP_HOME ? BT(BT_HOME) :
+@@ -1033,7 +1112,7 @@ static void begin_app_transition(void)
      ui.mascot_state = BUDDY_MASCOT_STATE_COUNT;
      if (!ui.startup) update_large_frame(&buddy_mascot_frames[ui.transition_mascot][0]);
      lv_obj_t *actor = ui.active_app == BUDDY_APP_CLOCK ? ui.clock_mascot : ui.app_transition;
@@ -539,7 +616,7 @@ index 1b80042..a28dcfe 100644
      lv_anim_del(ui.clock_mascot, mascot_set_y);
      lv_anim_del(ui.app_transition, mascot_set_y);
      lv_anim_t anim;
-@@ -1260,12 +1314,12 @@ static void create_channel(channel_t *channel, const char *name, bool gpu)
+@@ -1260,12 +1339,12 @@ static void create_channel(channel_t *channel, const char *name, bool gpu)
      channel->usage = lv_label_create(channel->gauge);
      lv_label_set_text(channel->usage, "--");
      channel->usage_caption = lv_label_create(channel->gauge);
@@ -554,7 +631,7 @@ index 1b80042..a28dcfe 100644
      channel->model = text(channel->button, BT(BT_WAITING_FOR_SENSORS), 0, 0, 100, &buddy_language_font_14, C_MUTED);
  }
  
-@@ -2051,6 +2105,14 @@ static void agent_tab_clicked(lv_event_t *event)
+@@ -2051,6 +2130,14 @@ static void agent_tab_clicked(lv_event_t *event)
      buddy_ui_motion_enter(tasks ? view->tasks_body : view->usage_body, 6, 180, 0);
  }
  
@@ -569,7 +646,7 @@ index 1b80042..a28dcfe 100644
  static void create_agent_page(agent_view_t *view, const buddy_codex_t *data, const agent_copy_t *copy)
  {
      view->data = data;
-@@ -2131,6 +2193,11 @@ static void create_agent_page(agent_view_t *view, const buddy_codex_t *data, con
+@@ -2131,6 +2218,11 @@ static void create_agent_page(agent_view_t *view, const buddy_codex_t *data, con
      view->tasks_body = box(view->page, 28, 100, 548, 300);
      for (unsigned i = 0; i < 3; ++i) {
          view->task_rows[i] = surface_card(view->tasks_body, 14);
@@ -581,7 +658,7 @@ index 1b80042..a28dcfe 100644
          view->task_dots[i] = box(view->task_rows[i], 0, 0, 10, 10);
          lv_obj_set_style_radius(view->task_dots[i], LV_RADIUS_CIRCLE, 0);
          lv_obj_set_style_bg_opa(view->task_dots[i], LV_OPA_COVER, 0);
-@@ -2612,35 +2679,115 @@ static void create_timer_page(void)
+@@ -2612,35 +2704,115 @@ static void create_timer_page(void)
  static void draw_weather_icon(lv_event_t *event)
  {
      if (!ui.weather.available) return;
@@ -715,7 +792,7 @@ index 1b80042..a28dcfe 100644
  
      ui.weather_page = buddy_weather_page_create(ui.screen);
      ui.shortcuts_page = buddy_shortcuts_page_create(ui.screen);
-@@ -2890,6 +3037,7 @@ void buddy_ui_init(void)
+@@ -2890,6 +3062,7 @@ void buddy_ui_init(void)
      select_channel(false);
      refresh_connection();
      ui.history_timer = lv_timer_create(history_tick, 1000, NULL);
@@ -723,7 +800,18 @@ index 1b80042..a28dcfe 100644
      create_startup();
      lv_scr_load(ui.screen);
      /* Global shade; it captures only the first wake gesture when fully off. */
-@@ -2922,6 +3070,7 @@ void buddy_ui_set_connection(buddy_connection_state_t state, const char *ssid,
+@@ -2916,12 +3089,17 @@ void buddy_ui_set_connection(buddy_connection_state_t state, const char *ssid,
+         ui.happy_started = lv_tick_get();
+         ui.pc_launch_pending = true;
+         ui.pc_launch_sequence = ui.stats.sequence;
++        ui.pc_connected_since_us = esp_timer_get_time();
++    }
++    if (state != BUDDY_PC_CONNECTED) {
++        ui.pc_launch_pending = false;
++        ui.pc_connected_since_us = 0;
+     }
+-    if (state != BUDDY_PC_CONNECTED) ui.pc_launch_pending = false;
+     ui.connection = state;
      /* Away only explains a quiet PC; it ends when Wi-Fi itself is gone. */
      if (state != BUDDY_PC_CONNECTED && state != BUDDY_PC_OFFLINE) ui.pc_away = false;
      if (state != BUDDY_PC_CONNECTED && ui.alert_key[0]) { ui.alert_key[0] = 0; visible(ui.alert.page, false); }
@@ -731,7 +819,7 @@ index 1b80042..a28dcfe 100644
      if (state == BUDDY_PROVISIONING) {
          /* Setup instructions always remain accessible, including after Clock. */
          dismiss_startup();
-@@ -3046,6 +3195,16 @@ void buddy_ui_update_stats(const buddy_stats_t *stats)
+@@ -3046,6 +3224,16 @@ void buddy_ui_update_stats(const buddy_stats_t *stats)
      lv_label_set_text(ui.host, stats->hostname[0] ? stats->hostname : BT(BT_PAIRED_PC));
      channel_reading(&ui.cpu, stats->cpu_usage, stats->cpu_temperature, stats->cpu_name);
      channel_reading(&ui.gpu, stats->gpu_usage, stats->gpu_temperature, stats->gpu_name);
@@ -748,7 +836,7 @@ index 1b80042..a28dcfe 100644
      memory_reading(ui.memory, stats->memory_used_mb, stats->memory_total_mb);
      memory_reading(ui.vram, stats->vram_used_mb, stats->vram_total_mb);
      char buf[64];
-@@ -3075,6 +3234,7 @@ void buddy_ui_update_stats(const buddy_stats_t *stats)
+@@ -3075,6 +3263,7 @@ void buddy_ui_update_stats(const buddy_stats_t *stats)
      if (away_changed) refresh_connection();
      maybe_auto_app();
      refresh_alert();
@@ -756,7 +844,7 @@ index 1b80042..a28dcfe 100644
      refresh_footer();
      refresh_visibility();
  }
-@@ -3116,10 +3276,10 @@ void buddy_ui_set_weather(const buddy_weather_t *weather)
+@@ -3116,10 +3305,10 @@ void buddy_ui_set_weather(const buddy_weather_t *weather)
      ui.weather = *weather;
      buddy_weather_page_update(weather);
      refresh_home();
@@ -769,7 +857,7 @@ index 1b80042..a28dcfe 100644
          lv_obj_set_style_text_font(ui.weather_text,font,0);
          lv_txt_get_size(&size, reading, font, 0, 0, 700, LV_TEXT_FLAG_NONE);
          int icon_width = weather->available ? 38 : 0;
-@@ -3132,14 +3292,115 @@ void buddy_ui_set_weather(const buddy_weather_t *weather)
+@@ -3132,14 +3321,115 @@ void buddy_ui_set_weather(const buddy_weather_t *weather)
      }
      if (strcmp(lv_label_get_text(ui.weather_note), note) != 0)
          lv_label_set_text(ui.weather_note, note);
@@ -886,7 +974,7 @@ index 1b80042..a28dcfe 100644
      ui.menu_open = false;
      ui.offline_handled = ui.connection != BUDDY_PC_CONNECTED;
      ui.pc_launch_pending = false;
-@@ -3214,9 +3475,11 @@ static prompt_metrics_t prompt_metrics(void)
+@@ -3214,9 +3504,11 @@ static prompt_metrics_t prompt_metrics(void)
  
  #define PROMPT_LOGO 32
  
@@ -899,7 +987,7 @@ index 1b80042..a28dcfe 100644
      if (ui.alert.page && ui.alert_key[0]) lv_obj_move_foreground(ui.alert.page);
      if (ui.confirm.page && ui.confirm_action != BUDDY_CONFIRM_NONE) lv_obj_move_foreground(ui.confirm.page);
      if (ui.install_page && ui.install_stage != BUDDY_INSTALL_NONE) lv_obj_move_foreground(ui.install_page);
-@@ -3380,15 +3643,11 @@ static void ago_text(char *buffer, size_t size, uint32_t seconds)
+@@ -3380,15 +3672,11 @@ static void ago_text(char *buffer, size_t size, uint32_t seconds)
      else snprintf(buffer, size, BT(BT_LU_H_AGO), (unsigned long)(seconds / 3600));
  }
  
@@ -917,7 +1005,7 @@ index 1b80042..a28dcfe 100644
      char key[sizeof(ui.alert_key)] = "";
      if (task) snprintf(key, sizeof(key), "%d|%.63s|%.31s", (int)app, task->title, task->project);
      if (!task || strcmp(key, ui.alert_dismissed) != 0) ui.alert_dismissed[0] = 0;
-@@ -3424,6 +3683,257 @@ static void refresh_alert(void)
+@@ -3424,6 +3712,257 @@ static void refresh_alert(void)
      show_overlay(ui.alert.page);
  }
  
@@ -1175,7 +1263,7 @@ index 1b80042..a28dcfe 100644
  void buddy_ui_set_album_art(uint32_t id, uint16_t size, uint8_t *pixels)
  {
      if (!pixels) return;
-@@ -3647,7 +4157,7 @@ buddy_ui_state_t buddy_ui_get_state(void)
+@@ -3647,7 +4186,7 @@ buddy_ui_state_t buddy_ui_get_state(void)
          .timer_completed = ui.timer_completed,
          .game_active = music_connected() && ui.stats.game.active,
          .pc_away = ui.pc_away,
@@ -1320,3 +1408,16 @@ index b97d924..01c8456 100644
 +        weather_stroke_color(ctx, x, y, scale, 20, 18, 18, 23, WX_RAIN, 2);
      }
  }
+diff --git a/firmware/sdkconfig.defaults b/firmware/sdkconfig.defaults
+index cd8de47..8a80e84 100644
+--- a/firmware/sdkconfig.defaults
++++ b/firmware/sdkconfig.defaults
+@@ -20,6 +20,8 @@ CONFIG_HTTPD_WS_PRE_HANDSHAKE_CB_SUPPORT=y
+ CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
+ CONFIG_HTTPD_MAX_URI_LEN=256
+ CONFIG_LWIP_MAX_SOCKETS=16
++# Smaller TCP MSS keeps segments under ~800B for reliable 2.4 GHz Wi-Fi on compact PCB antennas.
++CONFIG_LWIP_TCP_MSS=768
+ CONFIG_LV_COLOR_DEPTH_16=y
+ CONFIG_LV_MEM_CUSTOM=y
+ CONFIG_LV_MEMCPY_MEMSET_STD=y
