@@ -6,6 +6,39 @@
 
 ---
 
+## Screenshots
+
+| Home (Teddy + Live Summaries) | Clock & Weather Dashboard |
+| :---: | :---: |
+| ![Home screen](docs/screenshots/home.png) | ![Clock and Weather screen](docs/screenshots/clock.png) |
+
+| Mac Monitor (CPU, Disk, RAM, Net) | Media & NFC Jukebox |
+| :---: | :---: |
+| ![PC Monitor screen](docs/screenshots/monitor.png) | ![Media Now Playing screen](docs/screenshots/media.png) |
+
+| Claude Code Usage & Tasks | Amp Usage & Need-You Alerts |
+| :---: | :---: |
+| ![Claude Code screen](docs/screenshots/claude.png) | ![Amp screen](docs/screenshots/amp.png) |
+
+<details>
+<summary>More screenshots (Weather Detail)</summary>
+
+![Weather Detail screen](docs/screenshots/weather.png)
+
+</details>
+
+---
+
+## Hardware
+
+| Component | Notes | Where to Buy |
+| --- | --- | --- |
+| **Waveshare ESP32-S3-Touch-LCD-4.3B** (800×480 capacitive touch) | Required display board (case/box variant recommended for desk use) | [The Pi Hut (UK)](https://thepihut.com/products/esp32-s3-development-board-with-4-3-capacitive-touch-lcd-display-800-x-480?variant=43907110305987) · [Waveshare](https://www.waveshare.com/esp32-s3-touch-lcd-4.3b.htm) |
+| **M5Stack RFID Unit 2 (WS1850S)** | Optional — plugs into the board's HY2.0 I2C port for the NFC Album Jukebox (with NTAG215/216 cards) | [The Pi Hut (UK)](https://thepihut.com/products/m5stack-rfid-unit-2-ws1850s?variant=41165572309187) |
+| **USB-C data cable** | Required for initial flashing (day-to-day telemetry runs over 2.4 GHz Wi-Fi) | Any USB-C data cable |
+
+---
+
 ## Features
 
 - **Mac-native flasher & pairer (`clawpal_mac.py`):** Install and verify official signed ClawPal `v0.13.0` firmware directly from macOS, back up your factory flash, configure Wi-Fi/city/theme, and store the pairing token safely in your **macOS Keychain**.
