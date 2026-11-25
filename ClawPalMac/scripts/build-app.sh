@@ -44,6 +44,8 @@ cat > "$APP/Contents/Info.plist" << EOF
   <string>14.0</string>
   <key>LSUIElement</key>
   <true/>
+  <key>NSAppSleepDisabled</key>
+  <true/>
   <key>NSLocalNetworkUsageDescription</key>
   <string>ClawPalMac connects to your ClawPal desk display over your local Wi-Fi network.</string>
   <key>NSAppleEventsUsageDescription</key>

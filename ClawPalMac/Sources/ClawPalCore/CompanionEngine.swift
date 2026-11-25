@@ -81,6 +81,7 @@ public final class CompanionEngine: ObservableObject {
     private var mediaPollTask: Task<Void, Never>?
     private var ampPollTask: Task<Void, Never>?
     private var claudeLiveTask: Task<Void, Never>?
+    private var appNapActivity: NSObjectProtocol?
     private var seq: Int = 0
 
     private let wsSession: URLSession = {
@@ -190,6 +191,12 @@ public final class CompanionEngine: ObservableObject {
                 try? await Task.sleep(for: .seconds(30))
             }
         }
+        if appNapActivity == nil {
+            appNapActivity = ProcessInfo.processInfo.beginActivity(
+                options: [.userInitiatedAllowingIdleSystemSleep, .suddenTerminationDisabled],
+                reason: "Streaming 1 Hz live telemetry to ClawPal desk display"
+            )
+        }
         startClaudeLiveTask()
         mainLoopTask = Task { [weak self] in
             await self?.runConnectionLoop()
@@ -234,6 +241,10 @@ public final class CompanionEngine: ObservableObject {
         ampPollTask = nil
         claudeLiveTask?.cancel()
         claudeLiveTask = nil
+        if let token = appNapActivity {
+            ProcessInfo.processInfo.endActivity(token)
+            appNapActivity = nil
+        }
         status = .stopped
         appendLog("Companion paused")
     }
@@ -477,8 +488,19 @@ public final class CompanionEngine: ObservableObject {
         status = .connected(endpoint.host)
         appendLog("Connected to ClawPal at \(endpoint.host)")
 
-        refreshHealth()
-        if !settingsLoaded { refreshDisplaySettings() }
+        // Fetch initial /health and /settings once (sequentially, after WS settles) —
+        // no periodic /health polling needed while the WebSocket is streaming 1 Hz acks.
+        let needSettings = !settingsLoaded
+        Task { [weak self] in
+            try? await Task.sleep(for: .seconds(1.5))
+            guard !Task.isCancelled else { return }
+            self?.refreshHealth()
+            if needSettings {
+                try? await Task.sleep(for: .seconds(1.5))
+                guard !Task.isCancelled else { return }
+                self?.refreshDisplaySettings()
+            }
+        }
 
         let state = SessionState()
         let receiver = Task { [weak self] in
@@ -493,7 +515,6 @@ public final class CompanionEngine: ObservableObject {
         defer { artTask?.cancel() }
 
         let encoder = JSONEncoder()
-        var healthTick = 0
 
         while !Task.isCancelled {
             if state.receiverFailed {
@@ -576,11 +597,6 @@ public final class CompanionEngine: ObservableObject {
                     if result == 404 || result == 405 { artSupported = false }
                     else if result != 200 { artSentId = 0; artRetryAt = Date().addingTimeInterval(30) }
                 }
-            }
-
-            healthTick += 1
-            if healthTick % 60 == 0 {
-                refreshHealth()
             }
 
             try await Task.sleep(for: .seconds(1))
